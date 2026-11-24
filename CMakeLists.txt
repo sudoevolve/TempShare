@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TempShare VERSION 0.1.0 LANGUAGES CXX)
+project(TempShare VERSION 0.3.0 LANGUAGES C CXX)
 
 include(FetchContent)
 include(CTest)
@@ -18,20 +18,25 @@ FetchContent_Declare(qrcode
     GIT_REPOSITORY https://github.com/nayuki/QR-Code-generator.git
     GIT_TAG 7ad95cedd8464a87f82221283612732ae4f3f305
     SOURCE_SUBDIR tempshare-unused)
-FetchContent_MakeAvailable(aino httplib qrcode)
+FetchContent_Declare(miniz
+    GIT_REPOSITORY https://github.com/richgel999/miniz.git
+    GIT_TAG 174573d60290f447c13a2b1b3405de2b96e27d6c)
+FetchContent_MakeAvailable(aino httplib qrcode miniz)
+target_compile_definitions(miniz PRIVATE MINIZ_NO_ZLIB_COMPATIBLE_NAMES)
 
-foreach(asset IN ITEMS index.html styles.css app.js)
+foreach(asset IN ITEMS index.html styles.css app.js cast.html cast-host.js rtc.js)
     set(path "${CMAKE_CURRENT_SOURCE_DIR}/src/web/${asset}")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${path}")
     file(READ "${path}" "${asset}")
 endforeach()
 configure_file(src/core/web_assets.hpp.in generated/web_assets.hpp @ONLY)
 
-add_library(tempshare_core STATIC src/core/session.cpp src/core/http_server.cpp src/core/discovery.cpp)
+add_library(tempshare_core STATIC src/core/session.cpp src/core/http_server.cpp src/core/discovery.cpp
+    src/core/folder_archive.cpp)
 target_compile_features(tempshare_core PUBLIC cxx_std_17)
 target_include_directories(tempshare_core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(tempshare_core SYSTEM PRIVATE "${httplib_SOURCE_DIR}")
-target_link_libraries(tempshare_core PRIVATE Threads::Threads)
+target_link_libraries(tempshare_core PRIVATE Threads::Threads miniz)
 if(WIN32)
     target_link_libraries(tempshare_core PRIVATE ws2_32 iphlpapi)
 endif()

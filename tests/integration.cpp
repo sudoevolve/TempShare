@@ -1,4 +1,5 @@
 #include "core/discovery.hpp"
+#include "core/folder_archive.hpp"
 #include "core/http_server.hpp"
 #include "core/session.hpp"
 
@@ -176,6 +177,134 @@ void network_changes(const fs::path& path) {
     expect(peer.Get("/"), 200, "serve the reconnected LAN interface without restart");
 }
 
+void lan_features(const fs::path& path) {
+    tempshare::Session session(path / "chunked");
+    tempshare::HttpServer server(session);
+    require(server.start(0, true), "start feature server");
+    httplib::Client browser("127.0.0.1", server.port());
+    browser.set_read_timeout(3);
+    session.start();
+    const auto invitation = session.snapshot().invitation;
+    const auto pair = session.pair(invitation, "Test phone");
+    require(pair && session.decide_pairing(pair->token, true), "approve feature browser");
+    const std::string cookie = "ts_" + std::to_string(server.port()) + "=" + pair->token;
+    const httplib::Headers auth{{"Cookie", cookie}};
+    auto post = auth;
+    post.emplace("X-TempShare", "1");
+
+    expect(browser.Post("/api/text", {{"X-TempShare", "1"}}, "hello", "text/plain"),
+           403, "unauthorized browser cannot send text");
+    require(session.send_text("https://example.test/path"), "desktop sends a link");
+    expect(browser.Post("/api/text", post, u8"中文\ncode()", "text/plain"), 201, "browser sends multiline text");
+    const auto entries = browser.Get("/api/text", auth);
+    expect(entries, 200, "read text history");
+    require(entries->body.find("code()") != std::string::npos && session.snapshot().messages.size() == 2,
+            "both directions share the same history");
+    expect(browser.Post("/api/text", post, std::string(tempshare::max_text_size + 1, 'x'), "text/plain"),
+           400, "bound text request size");
+    session.set_permissions({true, true, false});
+    expect(browser.Get("/api/text", auth), 403, "revoke text permission");
+    require(session.snapshot().messages.empty(), "revoking text clears history");
+
+    const auto offer = session.offer(pair->token, "resume.txt", 8);
+    require(offer && session.decide_offer(offer->id, true), "approve resumable upload");
+    const auto upload = "/api/upload/" + offer->id;
+    auto first = post;
+    first.emplace("X-Upload-Offset", "0");
+    expect(browser.Put(upload, first, "1234", "application/octet-stream"), 201, "commit first chunk");
+    require(session.snapshot().offers[0].transferred == 4 && session.snapshot().received.empty(),
+            "hold partial uploads out of receive history");
+    expect(browser.Put(upload, first, "1234", "application/octet-stream"), 409, "reject duplicate offset");
+    auto second = post;
+    second.emplace("X-Upload-Offset", "4");
+    expect(browser.Put(upload, second, "5678", "application/octet-stream"), 201, "resume and commit file");
+    require(read(session.snapshot().received.back().path) == "12345678", "resumed bytes are intact");
+    const auto cancelled = session.offer(pair->token, "cancelled.txt", 8);
+    require(cancelled && session.decide_offer(cancelled->id, true), "approve cancellable chunked upload");
+    const auto cancel_path = "/api/upload/" + cancelled->id;
+    expect(browser.Put(cancel_path, first, "abcd", "application/octet-stream"), 201, "create partial upload");
+    expect(browser.Delete("/api/offers/" + cancelled->id, post), 204, "cancel partial upload");
+    expect(browser.Put(cancel_path, second, "efgh", "application/octet-stream"), 409, "cancel prevents resume");
+    for (const auto& file : fs::directory_iterator(session.snapshot().received.back().path.parent_path())) {
+        require(file.path().extension() != ".part", "cancel releases partial upload");
+    }
+
+    const auto folder = path / fs::u8path(u8"照片");
+    fs::create_directories(folder / "empty");
+    std::ofstream(folder / "notes.txt") << "packed";
+    auto archive = tempshare::archive_folder(folder, [] { return false; });
+    const auto zip_path = *archive.directory / "folder.zip";
+    require(session.share_archive(invitation, archive.name, std::move(archive.directory)), "publish folder ZIP");
+    auto shared = session.snapshot().shared;
+    require(shared.size() == 1, "folder is a single download");
+    const std::string download = "/api/download/" + shared.front().id;
+    const auto zip = browser.Get(download, auth);
+    expect(zip, 200, "download generated folder");
+    require(zip->body.rfind("PK", 0) == 0 && zip->body.find("/empty/") != std::string::npos &&
+            zip->body.find("/notes.txt") != std::string::npos, "ZIP includes nested files and empty directories");
+    session.set_permissions({false, true, false});
+    expect(browser.Get(download, auth), 404, "revoke download permission");
+    session.unshare(shared.front().id);
+    shared.clear();
+    require(!fs::exists(zip_path), "remove the ZIP after the last reference is released");
+
+    const auto cast_key = session.open_cast();
+    require(!cast_key.empty(), "desktop authorizes cast console");
+    expect(browser.Get("/api/cast/host", auth), 403, "pairing does not authorize cast host");
+    auto watching = post;
+    watching.emplace("X-Cast-Watch", "1");
+    expect(browser.Post("/api/cast/viewer", watching, "", "text/plain"), 200, "paired browser can request viewing");
+    const httplib::Headers host{{"X-TempShare", "1"}, {"X-Cast-Key", cast_key}};
+    const std::string sdp = "v=0\r\nc=IN IP4 203.0.113.5\r\n"
+        "a=candidate:1 1 UDP 2122260223 192.168.1.20 50000 typ host\r\n"
+        "a=candidate:2 1 UDP 2122260223 203.0.113.5 50001 typ host\r\n";
+    expect(browser.Post("/api/cast/offer", host, sdp, "text/plain"), 201, "publish LAN cast offer");
+    const auto offer_response = browser.Post("/api/cast/viewer", watching, "", "text/plain");
+    expect(offer_response, 200, "read sanitized LAN offer");
+    require(offer_response->body.find("192.168.1.20") != std::string::npos &&
+            offer_response->body.find("203.0.113.5") == std::string::npos, "only LAN candidates are signaled");
+    auto answer = post;
+    answer.emplace("X-Cast-Revision", "1");
+    expect(browser.Post("/api/cast/answer", answer, sdp, "text/plain"), 201, "accept current cast answer");
+    expect(browser.Post("/api/cast/answer", answer, sdp, "text/plain"), 409, "reject duplicate cast answer");
+    expect(browser.Post("/api/cast/stop", host, "", "text/plain"), 204, "stop cast");
+    expect(browser.Get("/api/cast/host", host), 403, "revoke cast console key");
+    expect(browser.Post("/api/pair/trusted", post, "", "text/plain"), 403, "persistent device trust requires HTTPS");
+    expect(browser.Delete("/api/pair", post), 204, "browser ends session");
+    expect(browser.Get("/api/pair", auth), 401, "browser disconnect revokes existing session");
+}
+
+void trusted_devices(const fs::path& path) {
+    const auto trust = path / "trusted";
+    std::string remembered;
+    {
+        tempshare::Session session(path, {}, 1min, trust);
+        session.start();
+        auto pair = session.pair(session.snapshot().code, "Phone");
+        require(pair && session.decide_pairing(pair->token, true), "approve device before trusting");
+        session.set_permissions({false, false, true});
+        require(session.remember_device(), "persist approved device and policy");
+        remembered = session.snapshot().pairing->trusted_key;
+    }
+    {
+        tempshare::Session session(path, {}, 1min, trust);
+        session.start();
+        require(!session.reconnect("unrecognized"), "reject unknown trust token");
+        const auto pair = session.reconnect(remembered);
+        require(pair && pair->name == "Phone" && !session.permissions().download &&
+                !session.permissions().upload && session.permissions().text, "restore persisted scoped trust");
+        session.set_permissions({true, false, false});
+        require(session.remember_device(), "update remembered permissions");
+    }
+    tempshare::Session session(path, {}, 1min, trust);
+    session.start();
+    const auto pair = session.reconnect(remembered);
+    require(pair && session.permissions().download && !session.permissions().upload &&
+            !session.permissions().text, "restore the updated permissions");
+    require(session.revoke_device(remembered) && !session.authorized(pair->token) &&
+            !session.reconnect(remembered), "revocation ends current trust and prevents future connections");
+}
+
 }  // namespace
 
 int main() {
@@ -184,6 +313,8 @@ int main() {
         roundtrip(scratch.path);
         session_lifetime(scratch.path);
         network_changes(scratch.path);
+        lan_features(scratch.path);
+        trusted_devices(scratch.path);
         const tempshare::LocalNetwork lan{"192.168.70.31", 0xc0a8461f, 0xffffff00};
         require(lan.contains("192.168.70.22") && !lan.contains("192.168.71.22") &&
                 !lan.contains("8.8.8.8"), "accept only the IPv4 LAN subnet");

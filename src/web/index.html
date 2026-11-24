@@ -6,13 +6,16 @@
   <meta name="theme-color" content="#101527">
   <title>TempShare</title>
   <link rel="stylesheet" href="/styles.css">
-  <script src="/app.js" defer></script>
+  <script src="/app.js" type="module"></script>
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
       <a class="brand" href="/" aria-label="TempShare 首页"><span aria-hidden="true">ϟ</span>TempShare</a>
-      <span id="connection" class="connection" aria-live="polite">未连接</span>
+      <div class="connection-actions">
+        <span id="connection" class="connection" aria-live="polite">未连接</span>
+        <button id="disconnect" type="button" hidden>断开</button>
+      </div>
     </header>
 
     <section id="connect-panel" class="hero" aria-labelledby="connect-title">
@@ -22,19 +25,28 @@
       <h1 id="connect-title">连接到电脑</h1>
       <p id="connect-description">输入电脑上显示的连接码。</p>
       <form id="pair-form">
+        <label for="device-name">设备名称</label>
+        <input id="device-name" class="device-name" name="device" autocomplete="off" maxlength="30" placeholder="我的设备">
         <label for="pair-code">连接码</label>
         <input id="pair-code" name="code" inputmode="numeric" autocomplete="off" minlength="6" maxlength="6"
                pattern="[0-9]{6}" placeholder="000000" required>
         <button class="primary" type="submit">请求连接</button>
+        <button id="trusted-connect" type="button" hidden>用已记住的设备连接</button>
       </form>
       <output id="verification" class="verification" aria-live="polite" hidden></output>
     </section>
 
+    <nav id="feature-nav" class="feature-nav" aria-label="功能" hidden>
+      <button type="button" data-panel="share" aria-pressed="true">文件分享</button>
+      <button type="button" data-panel="sync" aria-pressed="false">内容同步</button>
+      <button type="button" data-panel="cast" aria-pressed="false">屏幕投递</button>
+    </nav>
     <section id="share-panel" hidden>
       <div class="share-heading">
         <h1>文件分享</h1>
         <p>在同一局域网内与电脑传输文件。</p>
       </div>
+      <p id="upload-disabled" class="empty" hidden>电脑关闭了文件接收权限。</p>
       <label id="dropzone" class="dropzone" for="file-input">
         <input id="file-input" type="file" multiple>
         <span class="upload-mark" aria-hidden="true">↑</span>
@@ -51,6 +63,25 @@
         <ul id="download-list" class="file-list"></ul>
         <p id="no-files" class="empty">电脑分享文件后会显示在这里。</p>
       </section>
+    </section>
+    <section id="sync-panel" hidden>
+      <div class="share-heading"><h1>内容同步</h1></div>
+      <form id="sync-form" class="compose">
+        <label for="sync-text">文本、链接或代码</label>
+        <textarea id="sync-text" rows="4" maxlength="32768" required></textarea>
+        <button class="primary" type="submit">发送</button>
+      </form>
+      <p id="sync-disabled" class="empty" hidden>电脑关闭了文本同步权限。</p>
+      <label id="sync-image-label" class="image-picker">发送图片
+        <input id="sync-image" type="file" accept="image/*" multiple>
+      </label>
+      <ul id="sync-list" class="file-list" aria-label="本会话的内容"></ul>
+    </section>
+    <section id="cast-panel" hidden>
+      <div class="share-heading"><h1>屏幕投递</h1></div>
+      <video id="cast-video" class="cast-video" autoplay playsinline muted controls hidden></video>
+      <button id="cast-watch" class="primary" type="button">开始观看</button>
+      <p id="cast-status" class="message" role="status"></p>
     </section>
     <p id="message" class="message" role="status"></p>
   </main>

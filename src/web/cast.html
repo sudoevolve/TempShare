@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>屏幕投递 · TempShare</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/cast-host.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar"><strong class="brand"><span aria-hidden="true">ϟ</span>TempShare</strong></header>
+    <div class="share-heading">
+      <h1>屏幕投递</h1>
+      <p>选择要共享的屏幕、窗口或标签页。已配对设备可以在屏幕投递页观看。</p>
+    </div>
+    <video id="preview" class="cast-video" muted autoplay playsinline hidden></video>
+    <div class="cast-options">
+      <label>画质 <select id="quality">
+        <option value="720">720p</option>
+        <option value="1080">1080p</option>
+        <option value="480">480p</option>
+      </select></label>
+      <label>帧率 <select id="rate">
+        <option value="15">15 fps</option>
+        <option value="30">30 fps</option>
+        <option value="8">8 fps</option>
+      </select></label>
+      <label><input id="audio" type="checkbox"> 请求共享音频</label>
+    </div>
+    <div class="cast-actions">
+      <button id="start" type="button" class="primary" disabled>选择共享来源</button>
+      <button id="stop" type="button" hidden>结束投递</button>
+    </div>
+    <p id="status" class="message" role="status"></p>
+  </main>
+</body>
+</html>

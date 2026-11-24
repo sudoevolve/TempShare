@@ -4,15 +4,18 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace tempshare {
 
 inline constexpr std::uint64_t max_file_size = 1024ULL * 1024 * 1024;
+inline constexpr std::size_t max_text_size = 32 * 1024;
 
 enum class State { pending, approved, rejected, uploading, complete };
 
@@ -20,6 +23,8 @@ struct Pairing {
     std::string token;
     std::string verification;
     State state = State::pending;
+    std::string name;
+    std::string trusted_key;
 };
 
 struct File {
@@ -27,6 +32,7 @@ struct File {
     std::string name;
     std::uint64_t size;
     std::filesystem::path path;
+    std::shared_ptr<const std::filesystem::path> temporary_directory{};
 };
 
 struct Offer {
@@ -34,6 +40,31 @@ struct Offer {
     std::string name;
     std::uint64_t size;
     State state = State::pending;
+    std::uint64_t transferred = 0;
+};
+
+struct Permissions {
+    bool download = true;
+    bool upload = true;
+    bool text = true;
+};
+
+struct TrustedDevice {
+    std::string key;
+    std::string name;
+    Permissions permissions;
+};
+
+struct Message {
+    std::string text;
+    bool from_desktop;
+};
+
+struct CastSignal {
+    std::string offer;
+    std::string answer;
+    bool viewing = false;
+    unsigned revision = 0;
 };
 
 struct Snapshot {
@@ -45,10 +76,15 @@ struct Snapshot {
     std::vector<File> shared;
     std::vector<File> received;
     std::filesystem::path directory;
+    Permissions permissions;
+    std::vector<Message> messages;
+    bool casting = false;
+    bool trust_enabled = false;
+    std::vector<TrustedDevice> trusted;
 };
 
 struct Upload {
-    std::filesystem::path temporary;
+    std::shared_ptr<const std::filesystem::path> temporary;
     std::filesystem::path destination;
 };
 
@@ -57,19 +93,41 @@ class Session {
 public:
     using Clock = std::chrono::steady_clock;
     explicit Session(std::filesystem::path directory, std::function<void()> changed = {},
-                     Clock::duration lifetime = std::chrono::minutes(30));
+                     Clock::duration lifetime = std::chrono::minutes(30), std::filesystem::path trust_directory = {});
 
     void start();
     void end();
     bool is_active() const;
+    bool expire();
+    bool invitation_active(std::string_view invitation) const;
     Snapshot snapshot() const;
     bool set_directory(std::filesystem::path directory);
     bool share(const std::filesystem::path& path);
+    bool share_archive(std::string_view invitation, std::string name,
+                       std::shared_ptr<const std::filesystem::path> directory);
     void unshare(const std::string& id);
     bool decide_pairing(const std::string& token, bool accept);
+    bool disconnect(std::string_view token);
     bool decide_offer(const std::string& id, bool accept);
+    void set_permissions(Permissions permissions);
+    Permissions permissions() const;
+    bool send_text(std::string text);
+    bool send_text(std::string_view token, std::string text);
+    std::optional<std::vector<Message>> messages(std::string_view token) const;
+    std::uint64_t text_revision() const;
+    void clear_messages();
 
-    std::optional<Pairing> pair(std::string_view invitation);
+    std::string open_cast();
+    bool stop_cast(std::string_view token = {});
+    std::optional<CastSignal> cast_host(std::string_view token);
+    std::optional<CastSignal> cast_viewer(std::string_view token, bool viewing);
+    bool cast_offer(std::string_view token, std::string sdp);
+    bool cast_answer(std::string_view token, unsigned revision, std::string sdp);
+
+    std::optional<Pairing> pair(std::string_view invitation, std::string name = "浏览器");
+    std::optional<Pairing> reconnect(std::string_view trusted);
+    bool remember_device();
+    bool revoke_device(const std::string& key);
     std::optional<Pairing> pairing(std::string_view token) const;
     bool authorized(std::string_view token) const;
     bool downloading(std::string_view token, const std::string& id) const;
@@ -77,14 +135,20 @@ public:
     std::optional<Offer> offer(std::string_view token, std::string name, std::uint64_t size);
     std::optional<std::vector<Offer>> offers(std::string_view token) const;
     bool cancel_offer(std::string_view token, const std::string& id);
-    std::optional<Upload> begin_upload(std::string_view token, const std::string& id, std::uint64_t size);
+    std::optional<Upload> begin_upload(std::string_view token, const std::string& id,
+                                       std::uint64_t size, std::optional<std::uint64_t> offset = {});
     bool uploading(std::string_view token, const std::string& id) const;
-    bool finish_upload(std::string_view token, const std::string& id, const Upload& upload);
+    bool finish_upload(std::string_view token, const std::string& id, const Upload& upload,
+                       std::optional<std::uint64_t> transferred = {});
     void retry_upload(std::string_view token, const std::string& id);
 
 private:
     bool active() const;
+    void reset_content();
     bool has_access(std::string_view token) const;
+    bool add_message(std::string text, bool from_desktop);
+    bool cast_available() const;
+    bool cast_host_access(std::string_view token) const;
     void notify() const;
 
     mutable std::mutex mutex_;
@@ -97,10 +161,21 @@ private:
     std::string code_;
     std::optional<Pairing> pairing_;
     std::vector<Offer> offers_;
+    std::unordered_map<std::string, Upload> partials_;
     std::vector<File> shared_;
     std::vector<File> received_;
     std::filesystem::path directory_;
     std::filesystem::path staging_;
+    std::filesystem::path trust_directory_;
+    std::vector<TrustedDevice> trusted_;
+    Permissions permissions_;
+    std::vector<Message> messages_;
+    std::uint64_t text_revision_ = 0;
+    std::string cast_token_;
+    CastSignal cast_;
+    unsigned cast_revision_ = 0;
+    Clock::time_point cast_host_seen_{};
+    Clock::time_point cast_viewer_seen_{};
 };
 
 std::string random_token();

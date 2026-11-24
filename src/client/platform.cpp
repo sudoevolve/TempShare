@@ -1,6 +1,7 @@
 #include "platform.hpp"
 
 #include <cerrno>
+#include <cstdlib>
 #include <thread>
 
 #ifdef _WIN32
@@ -103,6 +104,26 @@ bool open_url(const std::string& url) {
     }).detach();
     return true;
 #endif
+}
+
+std::filesystem::path configuration_directory() {
+#ifdef _WIN32
+    const DWORD required = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (required) {
+        std::wstring root(required, L'\0');
+        const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", root.data(), required);
+        if (length && length < required) {
+            root.resize(length);
+            return std::filesystem::path(root) / "TempShare";
+        }
+    }
+#else
+    if (const auto* root = std::getenv("XDG_DATA_HOME")) {
+        if (*root) return std::filesystem::u8path(root) / "tempshare";
+    }
+    if (const auto* home = std::getenv("HOME")) return std::filesystem::u8path(home) / ".local/share/tempshare";
+#endif
+    return {};
 }
 
 #ifdef _WIN32
