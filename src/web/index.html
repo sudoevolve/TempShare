@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101527">
+  <title>TempShare</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="TempShare 首页"><span aria-hidden="true">ϟ</span>TempShare</a>
+      <span id="connection" class="connection" aria-live="polite">未连接</span>
+    </header>
+
+    <section id="connect-panel" class="hero" aria-labelledby="connect-title">
+      <div class="radar" aria-hidden="true">
+        <div class="radar-middle"><div class="radar-inner"><span class="computer"></span></div></div>
+      </div>
+      <h1 id="connect-title">连接到电脑</h1>
+      <p id="connect-description">输入电脑上显示的连接码。</p>
+      <form id="pair-form">
+        <label for="pair-code">连接码</label>
+        <input id="pair-code" name="code" inputmode="numeric" autocomplete="off" minlength="6" maxlength="6"
+               pattern="[0-9]{6}" placeholder="000000" required>
+        <button class="primary" type="submit">请求连接</button>
+      </form>
+      <output id="verification" class="verification" aria-live="polite" hidden></output>
+    </section>
+
+    <section id="share-panel" hidden>
+      <div class="share-heading">
+        <h1>文件分享</h1>
+        <p>在同一局域网内与电脑传输文件。</p>
+      </div>
+      <label id="dropzone" class="dropzone" for="file-input">
+        <input id="file-input" type="file" multiple>
+        <span class="upload-mark" aria-hidden="true">↑</span>
+        <strong>选择要发送的文件</strong>
+        <span>可选择多个文件，每个文件最高 1 GiB</span>
+      </label>
+
+      <section id="uploads" class="transfer-section" aria-labelledby="upload-title" hidden>
+        <h2 id="upload-title">发送队列</h2>
+        <ul id="upload-list" class="file-list"></ul>
+      </section>
+      <section class="transfer-section" aria-labelledby="download-title">
+        <h2 id="download-title">电脑分享的文件</h2>
+        <ul id="download-list" class="file-list"></ul>
+        <p id="no-files" class="empty">电脑分享文件后会显示在这里。</p>
+      </section>
+    </section>
+    <p id="message" class="message" role="status"></p>
+  </main>
+</body>
+</html>

@@ -1,0 +1,7 @@
+#pragma once
+
+namespace tempshare::web {
+inline constexpr char index[] = R"tempshare(@index.html@)tempshare";
+inline constexpr char styles[] = R"tempshare(@styles.css@)tempshare";
+inline constexpr char script[] = R"tempshare(@app.js@)tempshare";
+}
