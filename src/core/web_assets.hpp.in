@@ -4,6 +4,7 @@ namespace tempshare::web {
 inline constexpr char index[] = R"tempshare(@index.html@)tempshare";
 inline constexpr char styles[] = R"tempshare(@styles.css@)tempshare";
 inline constexpr char script[] = R"tempshare(@app.js@)tempshare";
+inline constexpr char appearance[] = R"tempshare(@appearance.js@)tempshare";
 inline constexpr char cast_page[] = R"tempshare(@cast.html@)tempshare";
 inline constexpr char cast_host[] = R"tempshare(@cast-host.js@)tempshare";
 inline constexpr char rtc[] = R"tempshare(@rtc.js@)tempshare";

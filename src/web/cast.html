@@ -3,27 +3,45 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101427">
   <title>屏幕投递 · TempShare</title>
   <link rel="stylesheet" href="/styles.css">
   <script type="module" src="/cast-host.js"></script>
+  <script type="module" src="/appearance.js"></script>
 </head>
 <body>
   <main class="shell">
-    <header class="topbar"><strong class="brand"><span aria-hidden="true">ϟ</span>TempShare</strong></header>
+    <header class="topbar">
+      <strong class="brand"><span aria-hidden="true">ϟ</span>TempShare</strong>
+      <select id="appearance" aria-label="外观">
+        <option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option>
+      </select>
+    </header>
     <div class="share-heading">
       <h1>屏幕投递</h1>
       <p>选择要共享的屏幕、窗口或标签页。已配对设备可以在屏幕投递页观看。</p>
     </div>
     <video id="preview" class="cast-video" muted autoplay playsinline hidden></video>
     <div class="cast-options">
+      <label>预设 <select id="cast-profile">
+        <option value="custom">自定义</option>
+        <option value="smooth">流畅</option>
+        <option value="clear">清晰</option>
+        <option value="original">原始分辨率</option>
+      </select></label>
       <label>画质 <select id="quality">
+        <option value="0">原始分辨率</option>
+        <option value="2160">2160p · 4K</option>
+        <option value="1440">1440p · QHD</option>
+        <option value="1080" selected>1080p</option>
         <option value="720">720p</option>
-        <option value="1080">1080p</option>
         <option value="480">480p</option>
       </select></label>
       <label>帧率 <select id="rate">
+        <option value="120">120 fps</option>
+        <option value="60">60 fps</option>
+        <option value="30" selected>30 fps</option>
         <option value="15">15 fps</option>
-        <option value="30">30 fps</option>
         <option value="8">8 fps</option>
       </select></label>
       <label><input id="audio" type="checkbox"> 请求共享音频</label>
@@ -33,6 +51,8 @@
       <button id="stop" type="button" hidden>结束投递</button>
     </div>
     <p id="status" class="message" role="status"></p>
+    <p id="capture-info" class="message"></p>
+    <p id="audio-info" class="message"></p>
   </main>
 </body>
 </html>

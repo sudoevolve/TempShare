@@ -1,5 +1,31 @@
 const storageKey = 'tempshare-upload-resume-v1';
 const blockSize = 4 * 1024 ** 2;
+let database;
+
+function uploadHandles() {
+  if (!database) database = new Promise((resolve, reject) => {
+    const open = indexedDB.open('TempShare-upload-handles', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('handles');
+    open.onsuccess = () => resolve(open.result);
+    open.onerror = () => reject(open.error);
+  });
+  return database;
+}
+
+export async function savedHandle(id, handle) {
+  try {
+    const db = await uploadHandles();
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction('handles', handle ? 'readwrite' : 'readonly');
+      const store = transaction.objectStore('handles');
+      const request = handle ? store.put(handle, id) : store.get(id);
+      transaction.oncomplete = () => resolve(request.result);
+      transaction.onabort = () => reject(transaction.error);
+    });
+  } catch {
+    return undefined;
+  }
+}
 
 // Hash fixed-size blocks first so a large file can be verified without reading it all into memory.
 export async function fingerprint(file, cancelled) {
@@ -36,8 +62,16 @@ export function rememberUpload(entry) {
 }
 
 export function forgetUpload(id) {
+  const discarded = id ? [id] : resumableUploads().map((entry) => entry.id);
   try {
     if (id) sessionStorage.setItem(storageKey, JSON.stringify(resumableUploads().filter((entry) => entry.id !== id)));
     else sessionStorage.removeItem(storageKey);
   } catch { /* Private browsing or disabled storage. */ }
+  if (discarded.length && typeof window.showOpenFilePicker === 'function') {
+    uploadHandles().then((db) => {
+      const transaction = db.transaction('handles', 'readwrite');
+      const store = transaction.objectStore('handles');
+      for (const entry of discarded) store.delete(entry);
+    }).catch(() => {});
+  }
 }

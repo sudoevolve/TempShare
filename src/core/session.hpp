@@ -23,7 +23,7 @@ inline constexpr std::size_t max_text_size = 32 * 1024;
 
 enum class State { pending, approved, rejected, uploading, complete };
 enum class UploadFailure { unavailable, storage, insufficient_space };
-enum class SnapshotPage { all, share, sync, received, devices, settings, cast, nearby };
+enum class SnapshotPage { all, share, sync, received, devices, settings, cast, nearby, home };
 
 struct Pairing {
     std::string token;
@@ -31,6 +31,7 @@ struct Pairing {
     State state = State::pending;
     std::string name;
     std::string trusted_key;
+    std::uint64_t remaining_seconds = 0;
 };
 
 struct File {
@@ -40,6 +41,9 @@ struct File {
     std::filesystem::path path;
     std::optional<SourceVersion> source{};
     std::shared_ptr<const std::filesystem::path> temporary_directory{};
+    bool folder = false;
+    std::string received_from{};
+    std::uint64_t received_at = 0;
 };
 
 struct Offer {
@@ -48,6 +52,9 @@ struct Offer {
     std::uint64_t size;
     State state = State::pending;
     std::uint64_t transferred = 0;
+    std::string batch{};
+    std::string relative_directory{};
+    bool image = false;
 };
 
 struct Permissions {
@@ -65,6 +72,8 @@ struct TrustedDevice {
 struct Message {
     std::string text;
     bool from_desktop;
+    std::uint64_t sent_at = 0;
+    std::string attachment{};
 };
 
 struct CastSignal {
@@ -73,6 +82,12 @@ struct CastSignal {
     bool viewing = false;
     unsigned revision = 0;
     bool ready = false;
+    bool frames = false;
+};
+
+struct CastFrame {
+    std::uint64_t sequence = 0;
+    std::string jpeg;
 };
 
 struct Snapshot {
@@ -91,6 +106,23 @@ struct Snapshot {
     std::vector<TrustedDevice> trusted;
     bool capture_ready = false;
     bool viewer_answered = false;
+    bool cast_compatibility = false;
+    std::uint64_t remaining_seconds = 0;
+    std::size_t pending_transfers = 0;
+};
+
+struct NotificationState {
+    std::filesystem::path directory;
+    std::string pairing;
+    std::string offer;
+    std::string received;
+};
+
+struct FolderProgress {
+    std::size_t scanned = 0;
+    std::size_t skipped = 0;
+    std::size_t added = 0;
+    std::size_t removed = 0;
 };
 
 struct Upload {
@@ -103,16 +135,23 @@ class Session {
 public:
     using Clock = std::chrono::steady_clock;
     explicit Session(std::filesystem::path directory, std::function<void()> changed = {},
-                     Clock::duration lifetime = std::chrono::minutes(30), std::filesystem::path trust_directory = {});
+                     Clock::duration lifetime = std::chrono::minutes(30), std::filesystem::path trust_directory = {},
+                     std::filesystem::path history_file = {});
 
     void start();
     void end();
+    bool extend();
     bool is_active() const;
     bool expire();
     bool invitation_active(std::string_view invitation) const;
     Snapshot snapshot(SnapshotPage page = SnapshotPage::all) const;
+    NotificationState notification_state() const;
+    bool clear_received();
     bool set_directory(std::filesystem::path directory);
-    bool share(const std::filesystem::path& path);
+    bool share(const std::filesystem::path& path, bool image = false);
+    bool share_folder(std::string_view invitation, const std::filesystem::path& path,
+                      const std::string& refresh = {}, const std::function<bool()>& cancelled = {},
+                      const std::function<void(FolderProgress)>& progress = {});
     bool share_archive(std::string_view invitation, std::string name,
                        std::shared_ptr<const std::filesystem::path> directory);
     void unshare(const std::string& id);
@@ -125,28 +164,40 @@ public:
     bool send_text(std::string text);
     bool send_text(std::string_view token, std::string text);
     std::optional<std::vector<Message>> messages(std::string_view token) const;
+    std::optional<File> message_attachment(std::string_view token, std::string_view id) const;
     std::uint64_t text_revision() const;
     void clear_messages();
+    bool clear_messages(std::string_view token);
 
     std::string open_cast();
     bool stop_cast(std::string_view token = {});
     std::optional<CastSignal> cast_host(std::string_view token);
     bool cast_ready(std::string_view token);
     std::optional<bool> capture_ready(std::string_view token) const;
-    std::optional<CastSignal> cast_viewer(std::string_view token, bool viewing, std::string_view viewer = {});
+    std::optional<CastSignal> cast_viewer(std::string_view token, bool viewing, std::string_view viewer = {},
+                                          bool frames = false);
     bool cast_offer(std::string_view token, std::string sdp);
     bool cast_answer(std::string_view token, unsigned revision, std::string sdp, std::string_view viewer = {});
+    bool publish_cast_frame(std::string_view token, unsigned revision, std::string jpeg);
+    std::optional<CastFrame> cast_frame(std::string_view token, std::string_view viewer, std::uint64_t after) const;
 
     std::optional<Pairing> pair(std::string_view invitation, std::string name = "浏览器");
     std::optional<Pairing> reconnect(std::string_view trusted);
     bool remember_device();
     bool revoke_device(const std::string& key);
     std::optional<Pairing> pairing(std::string_view token) const;
+    std::string_view pairing_error(std::string_view token) const;
     bool authorized(std::string_view token) const;
     bool upload_allowed(std::string_view token) const;
-    bool downloading(std::string_view token, const std::string& id) const;
+    bool downloading(std::string_view token, const std::string& id, const std::string& folder = {}) const;
     std::optional<std::vector<File>> shared(std::string_view token) const;
-    std::optional<Offer> offer(std::string_view token, std::string name, std::uint64_t size);
+    std::optional<std::vector<File>> folder_contents(std::string_view token, const std::string& root,
+                                                     const std::string& directory) const;
+    std::optional<File> folder_file(std::string_view token, const std::string& root, const std::string& id) const;
+    std::optional<std::vector<File>> folder_selection(std::string_view token, const std::string& root,
+        const std::string& directory, const std::vector<std::string>& selected) const;
+    std::optional<Offer> offer(std::string_view token, std::string name, std::uint64_t size, std::string batch = {},
+                               std::string relative_directory = {}, bool image = false);
     std::optional<std::vector<Offer>> offers(std::string_view token) const;
     std::uint64_t files_revision() const;
     std::uint64_t offers_revision() const;
@@ -166,6 +217,8 @@ private:
     bool add_message(std::string text, bool from_desktop);
     bool cast_available() const;
     bool cast_host_access(std::string_view token) const;
+    void reset_cast_signal();
+    bool save_received() const;
 
     mutable std::mutex mutex_;
     std::function<void()> changed_;
@@ -177,13 +230,22 @@ private:
     std::string invitation_;
     std::string code_;
     std::optional<Pairing> pairing_;
+    std::string previous_pairing_;
+    std::string_view previous_pairing_error_ = "session_ended";
     std::vector<Offer> offers_;
     std::uint64_t offers_revision_ = 0;
     std::uint64_t committed_bytes_ = 0;
     std::unordered_map<std::string, Upload> partials_;
     std::vector<File> shared_;
+    struct FolderNode {
+        File entry;
+        std::vector<std::string> children;
+    };
+    using FolderTree = std::unordered_map<std::string, FolderNode>;
+    std::unordered_map<std::string, FolderTree> folders_;
     std::uint64_t files_revision_ = 0;
     std::vector<File> received_;
+    std::filesystem::path history_file_;
     std::filesystem::path directory_;
     std::filesystem::path staging_;
     std::filesystem::path trust_directory_;
@@ -193,6 +255,8 @@ private:
     std::uint64_t text_revision_ = 0;
     std::string cast_token_;
     CastSignal cast_;
+    CastFrame cast_frame_;
+    Clock::time_point cast_frame_at_{};
     unsigned cast_revision_ = 0;
     Clock::time_point cast_host_seen_{};
     Clock::time_point cast_viewer_seen_{};

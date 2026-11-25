@@ -10,14 +10,21 @@
 | `POST /api/pair` | `X-Invitation` 为六位短码或二维码中的邀请令牌。可使用编码后的 `X-Device-Name`。成功返回 201、验证码和会话 Cookie，桌面批准后获得访问权限。 |
 | `GET /api/pair` | 返回 `state`、权限、列表版本和 `castReady`。401 表示会话不可用。 |
 | `DELETE /api/pair` | 撤销当前请求或配对会话，成功返回 204。 |
-| `POST /api/pair/trusted` | HTTPS 下使用此前保存的 `ts_trusted` Cookie 快速配对。 |
+| `POST /api/pair/trusted` | HTTPS 下使用此前保存的 `ts_<端口>_trusted` Cookie 快速配对，兼容已有的旧版 Cookie。 |
 
 `filesRevision`、`offersRevision` 和 `textRevision` 是资源变化提示。版本变化后重新读取对应列表。版本值由当前服务进程维护。
 
 ## 文件
 
 - `GET /api/files` 返回已分享文件的名称、大小和 ID。使用 `GET /api/download/<id>` 下载，支持 HTTP Range。
+- `GET /api/files?folders=1` 同时返回可浏览的文件夹。目录条目带有 `folder: true`。
+- `GET /api/folders/<root>/entries/<directory>` 返回指定目录的直属子项。浏览顶层时，`directory` 填 `root`。无法下载的文件带有 `unavailable: true`。目录清单在桌面共享时生成。
+- 传入 `offset` 以每页至多 80 项读取目录，并从 `X-Folder-Count` 获取筛选后的数量。可指定 `q` 搜索文件名和 `sort=size` 按大小排序。
+- `GET /api/folders/<root>/download/<id>` 下载该共享目录中的单个文件，支持 HTTP Range。两条目录接口都需要配对批准及下载权限，移除根目录后会同时撤销所有子项的访问。
+- `GET /api/folders/<root>/zip/<directory>` 归档当前目录。用重复的 `file=<id>` 参数指定至多 80 个当前目录的直属条目。归档使用共享清单，并检查源文件版本和下载权限。
+- 下载接口接受 `HEAD` 检查可用性。列表中的 `preview` 指明支持的媒体类型，使用同一下载链接并加上 `preview=1` 获取可预览内容。
 - `POST /api/offers` 带 URL 编码的 `X-File-Name` 和字节数 `X-File-Size` 创建上传请求。桌面批准后，状态从 `pending` 进入 `approved`。用 `GET /api/offers` 读取状态，`DELETE /api/offers/<id>` 取消请求。
+- 可选的 `X-Upload-Batch` 为同次文件选择共享的 32 位十六进制标识。`X-Upload-Directory` 为 URL 编码的相对父目录。每一级目录由服务端验证。
 - `PUT /api/upload/<id>` 写入字节。分块请求带 `X-Upload-Offset`，单块最多 4 MiB。服务器校验偏移并在成功时返回已保存的字节数 `transferred`。最终块发布文件，状态进入 `complete`。同一请求中断后，先读取最新状态与偏移再重试。旧客户端可用无偏移的 PUT 一次上传整份文件。
 - 本地会话的总接收量为 4 GiB，单文件最多 1 GiB。服务为控制请求留出工作线程，同时处理最多 4 个文件上传或下载。
 
@@ -36,5 +43,6 @@
 - 本机投递控制台通过 `X-Cast-Key` 使用 `/api/cast/host`、`/api/cast/ready`、`/api/cast/offer` 和 `/api/cast/stop`。
 - 已配对的观看端向 `POST /api/cast/viewer` 发送 `X-Cast-Watch: 1`，并为当前观看操作生成一个 32 位十六进制值，放在 `X-Cast-Viewer` 中。定期刷新；退出时携带同一标识和 `X-Cast-Watch: 0`。活跃租约被其他标签页占用时返回 409。旧客户端可沿用无 `X-Cast-Viewer` 的单观看者流程。
 - `POST /api/cast/answer` 带同一观看标识及 `X-Cast-Revision`，正文为 SDP。信令由桌面端提供，媒体经浏览器间的 WebRTC 流传输。
+- 观看端可在刷新租约时带上 `X-Cast-Frames: 1` 请求兼容播放，并通过返回的 `frames` 字段确认。控制台使用本机授权和当前 `X-Cast-Revision` 向 `POST /api/cast/frame` 提交不超过 384 KiB 的 JPEG。已配对的观看端携带原租约标识从 `GET /api/cast/frame` 获取单帧，可用 `X-Cast-After` 传入上次响应的 `X-Cast-Sequence`。无更新时返回 204。
 
 [局域网 HTTPS 与设备验收](lan-https.md)

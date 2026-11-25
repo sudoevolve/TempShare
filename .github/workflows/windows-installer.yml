@@ -1,0 +1,43 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path CMakeLists.txt -Pattern '^project\(TempShare VERSION ([0-9.]+) ').Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_NAME -cne "v$version") { throw "Tag must be v$version" }
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6/ISCC.exe'
+          if (!(Test-Path -LiteralPath $compiler)) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE) { throw 'Inno Setup installation failed' }
+          }
+          ./packaging/windows/package.ps1 -Compiler $compiler
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tempshare-windows-x64-installer
+          path: build/package/
+          if-no-files-found: error

@@ -80,7 +80,7 @@ void add_network(std::vector<LocalNetwork>& networks, const sockaddr* address, s
         return network.ip == ip;
     });
     if (found == networks.end()) {
-        networks.push_back({format_address(native), ip, mask});
+        networks.push_back({format_address(native), ip, mask, {}, false});
     }
 }
 
@@ -119,6 +119,8 @@ std::optional<Peer> announcement(std::string_view packet, std::string address) {
 }
 
 }  // namespace
+
+std::string device_hostname() { return hostname(); }
 
 std::string Peer::url() const {
     return std::string(secure ? "https://" : "http://") + address + ':' + std::to_string(port) + '/';
@@ -301,7 +303,7 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
     auto next_send = Clock::now();
     while (running_ && networks_() == networks) {
         const auto now = Clock::now();
-        if (now >= next_send) {
+        if (refresh_.exchange(false) || now >= next_send) {
             for (const auto& network : networks) {
                 in_addr local{};
                 inet_pton(AF_INET, network.address.c_str(), &local);
@@ -361,5 +363,7 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
         if (changed && changed_) changed_();
     }
 }
+
+void Discovery::refresh() { refresh_ = true; }
 
 }  // namespace tempshare

@@ -121,4 +121,48 @@ FolderArchive archive_folder(const std::filesystem::path& folder, const std::fun
     return {name + ".zip", std::move(directory)};
 }
 
+FolderArchive archive_files(std::string name, const std::filesystem::path& root, const std::vector<File>& files,
+                            const std::function<bool()>& cancelled) {
+    namespace fs = std::filesystem;
+    if (!valid_filename(name + ".zip")) name = "TempShare";
+    auto directory = temporary_directory();
+    Archive archive(*directory / "folder.zip", cancelled);
+    std::uint64_t total = 0;
+    for (const auto& file : files) {
+        if (cancelled()) throw std::runtime_error("打包已取消");
+        const auto relative = file.path.lexically_relative(root);
+        if (relative.empty() || relative.is_absolute() || fs::canonical(file.path) != file.path) {
+            throw std::runtime_error("共享目录已变动");
+        }
+        auto zip_name = name;
+        if (relative != ".") {
+            for (const auto& component : relative) {
+                if (!valid_filename(component.u8string())) throw std::runtime_error("存在无法跨平台解压的文件名");
+            }
+            zip_name += '/' + relative.generic_u8string();
+        }
+        if (file.folder) {
+            zip_name += '/';
+            if (!mz_zip_writer_add_mem(&archive.zip, zip_name.c_str(), nullptr, 0, 0)) {
+                throw std::runtime_error("无法写入 ZIP 目录");
+            }
+            continue;
+        }
+        SharedSource source(file.path);
+        if (!file.source || !(source.version() == file.source) || file.size > max_file_size - total) {
+            throw std::runtime_error("共享文件已变动、不可读取或超过 1 GiB");
+        }
+        total += file.size;
+        Entry entry{source, *file.source, cancelled};
+        if (!mz_zip_writer_add_read_buf_callback(&archive.zip, zip_name.c_str(), read_entry, &entry, file.size,
+                nullptr, nullptr, 0, MZ_BEST_SPEED, nullptr, 0, nullptr, 0) || entry.copied != file.size) {
+            throw std::runtime_error("无法打包所选文件");
+        }
+    }
+    if (cancelled() || !mz_zip_writer_finalize_archive(&archive.zip)) throw std::runtime_error("无法完成 ZIP 文件");
+    archive.output.close();
+    if (!archive.output) throw std::runtime_error("无法保存 ZIP 文件");
+    return {name + ".zip", std::move(directory)};
+}
+
 }  // namespace tempshare

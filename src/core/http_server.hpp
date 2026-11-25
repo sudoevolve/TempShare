@@ -23,6 +23,7 @@ public:
     void stop();
     unsigned short port() const { return port_; }
     std::string url(const std::string& address) const;
+    bool probe(const std::string& address) const;
     std::vector<LocalNetwork> networks() const;
     bool update_networks(std::vector<LocalNetwork> networks);
 

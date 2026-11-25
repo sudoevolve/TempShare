@@ -1,7 +1,7 @@
 'use strict';
 
-import { gather, peerConnection } from './rtc.js';
-import { fingerprint, forgetUpload, rememberUpload, resumableUploads } from './resume.js';
+import { gather, peerConnection, timedFetch } from './rtc.js';
+import { fingerprint, forgetUpload, rememberUpload, resumableUploads, savedHandle } from './resume.js';
 
 const byId = (id) => document.getElementById(id);
 const pairForm = byId('pair-form');
@@ -12,14 +12,30 @@ const maxFileSize = 1024 ** 3;
 const chunkSize = 4 * 1024 ** 2;
 const pollInterval = 1100;
 let connection = '';
+let computerName = '';
+let sessionSeconds = 0;
 let generation = 0;
-let shownDownloads = '';
+let sharedEntries = [];
+let downloadAllowed = true;
+let folderPath = [];
+let folderEntries = [];
+let folderRequest = 0;
+let folderLoading = false;
+let folderError = '';
+const folderPageSize = 80;
+let folderTotal = 0;
+let folderSearchTimer;
+let selectingFolder = false;
+const selectedFolderEntries = new Set();
+let shareRestored = false;
 let polling = false;
 let pairing = false;
 let pairingAttempt = 0;
 let interrupted = false;
 let tab = 'share';
 let shownMessages = '';
+let syncMessages = [];
+let unreadMessages = 0;
 let knownTextRevision = -1;
 let knownFilesRevision = -1;
 let knownOffersRevision = -1;
@@ -31,6 +47,16 @@ let castGeneration = 0;
 let castViewer = '';
 let refreshingCast = false;
 let captureReady = false;
+let screenLock;
+let castStarted = 0;
+let lastVideoTime = -1;
+let lastFrameAt = 0;
+let lastVideoFrames = 0;
+let useFrames = false;
+let frameSequence = '0';
+let frameTimer;
+const castVideo = byId('cast-video');
+const castCanvas = byId('cast-frames');
 let shownRecovery = '';
 const trustedConnect = byId('trusted-connect');
 trustedConnect.hidden = location.protocol !== 'https:';
@@ -43,7 +69,7 @@ function message(text, error = false) {
   notice.classList.toggle('error', error);
 }
 
-function showConnection(state, verification = '') {
+function showConnection(state, verification = '', reason = '') {
   const states = {
     '': ['未连接', '连接到电脑', '输入电脑上显示的连接码。'],
     pending: ['待确认', '等待电脑确认', '请在电脑上核对以下验证码并允许连接。'],
@@ -53,13 +79,16 @@ function showConnection(state, verification = '') {
   const changed = connection !== state;
   connection = state;
   byId('connection').dataset.state = state;
-  byId('connection').textContent = badge;
+  const connected = state === 'approved';
+  byId('connection').textContent = connected && computerName ? `${computerName} · ${badge}` : badge;
+  document.body.classList.toggle('paired', connected);
   const disconnect = byId('disconnect');
   disconnect.hidden = state === '';
   disconnect.textContent = state === 'pending' ? '取消请求' : '断开';
   byId('retry-connection').hidden = state !== '' || pairing;
   byId('connect-title').textContent = title;
-  byId('connect-description').textContent = description;
+  byId('connect-description').textContent = state === 'pending' && sessionSeconds
+    ? `${description} 剩余 ${sessionSeconds} 秒。` : description;
   byId('connect-panel').hidden = state === 'approved';
   byId('feature-nav').hidden = state !== 'approved';
   for (const feature of ['share', 'sync', 'cast']) {
@@ -72,9 +101,12 @@ function showConnection(state, verification = '') {
     generation++;
     for (const item of queue) item.request?.abort();
     queue.length = 0;
+    updateQueueSummary();
+    if (byId('file-preview').open) byId('file-preview').close();
     byId('upload-list').replaceChildren();
     byId('uploads').hidden = true;
     showDownloads([]);
+    shareRestored = false;
     showMessages([]);
     knownTextRevision = -1;
     knownFilesRevision = -1;
@@ -85,26 +117,36 @@ function showConnection(state, verification = '') {
     byId('sync-text').value = '';
     showCastAvailability(false);
     stopViewing(false);
-    message('连接已结束或被拒绝，请使用电脑上显示的新连接码。', true);
+    const reasons = {
+      pairing_denied: '电脑拒绝了连接。请扫码或输入新连接码。',
+      approval_expired: '等待确认超时。请使用电脑上的新连接码。',
+      session_expired: '会话已到期。请在电脑上新建会话，再扫码或输入连接码。',
+      session_ended: '连接已结束。请使用电脑上显示的新连接码。',
+    };
+    message(reasons[reason] || reasons.session_ended, true);
   } else if (changed) {
     message('');
   }
 }
 
 function request(path, method = 'GET', headers = {}, body) {
-  return fetch(path, { method, headers: method === 'GET' ? headers : { 'X-TempShare': '1', ...headers },
-    body, cache: 'no-store', signal: AbortSignal.timeout(4500) });
+  return timedFetch(path, { method, headers: method === 'GET' ? headers : { 'X-TempShare': '1', ...headers },
+    body, cache: 'no-store' });
 }
 
 function showTab(feature) {
   if (tab === feature) return;
-  if (tab === 'cast') stopViewing();
   tab = feature;
+  if (tab === 'sync') {
+    unreadMessages = 0;
+    byId('sync-unread').hidden = true;
+  }
   for (const button of byId('feature-nav').querySelectorAll('[data-panel]')) {
     const selected = button.dataset.panel === tab;
     button.setAttribute('aria-pressed', String(selected));
     byId(button.dataset.panel + '-panel').hidden = !selected;
   }
+  byId('resume-watching').hidden = !watching || tab === 'cast';
   poll();
 }
 
@@ -161,20 +203,289 @@ function fileRow(name, subtitle) {
 }
 
 function showDownloads(files) {
-  const key = JSON.stringify(files);
-  if (key === shownDownloads) return;
-  shownDownloads = key;
-  byId('no-files').hidden = files.length !== 0;
-  byId('download-list').replaceChildren(...files.map((file) => {
-    const { row } = fileRow(file.name, formatSize(file.size));
-    const link = element('a', 'download', '下载');
-    link.href = `/api/download/${encodeURIComponent(file.id)}`;
-    link.download = file.name;
-    link.setAttribute('aria-label', `下载 ${file.name}`);
-    row.append(link);
-    return row;
-  }));
+  sharedEntries = files;
+  const available = (path) => path.length && files.some((entry) => entry.folder && entry.id === path[0].id);
+  if (!shareRestored && files.length) {
+    shareRestored = true;
+    const stored = history.state?.folder || [];
+    if (Array.isArray(stored) && available(stored)) {
+      openFolder(stored);
+      return;
+    }
+  }
+  if (available(folderPath)) {
+    openFolder(folderPath, false, false, true);
+    return;
+  }
+  openFolder([]);
 }
+
+async function previewFile(file, href) {
+  const viewer = byId('file-preview');
+  const content = byId('preview-content');
+  const target = new URL(href, location.href);
+  target.searchParams.set('preview', '1');
+  byId('preview-name').textContent = file.name;
+  const status = element('p', 'empty', '正在加载…');
+  status.setAttribute('role', 'status');
+  content.replaceChildren(status);
+  viewer.showModal();
+  try {
+    const response = await request(target.href, 'HEAD');
+    if (!response.ok) throw new Error('preview');
+    if (!viewer.open || !content.contains(status)) return;
+    if (file.preview.startsWith('text/')) {
+      const result = await request(target.href);
+      if (!result.ok) throw new Error('preview');
+      const value = await result.text();
+      if (content.contains(status)) content.replaceChildren(element('pre', 'sync-body', value));
+      return;
+    }
+    if (file.preview.startsWith('image/')) {
+      const image = element('img', 'preview-media');
+      image.alt = file.name;
+      image.src = target.href;
+      image.addEventListener('error', () => image.replaceWith(element('p', 'empty', '无法打开图片。')));
+      status.replaceWith(image);
+    } else if (file.preview.startsWith('video/')) {
+      const video = element('video', 'preview-media');
+      video.src = target.href;
+      video.controls = true;
+      video.playsInline = true;
+      video.addEventListener('error', () => video.replaceWith(element('p', 'empty', '当前浏览器无法播放此视频。')));
+      status.replaceWith(video);
+    } else {
+      const pdf = element('a', 'download', '在新标签页打开 PDF');
+      pdf.href = target.href;
+      pdf.target = '_blank';
+      pdf.rel = 'noopener noreferrer';
+      status.replaceWith(pdf);
+    }
+  } catch {
+    if (content.contains(status)) status.textContent = '无法预览，文件可能已移除或发生变化。';
+  }
+}
+
+byId('close-preview').addEventListener('click', () => byId('file-preview').close());
+byId('file-preview').addEventListener('close', () => byId('preview-content').replaceChildren());
+
+function downloadRow(file, root) {
+  let description = formatSize(file.size);
+  if (file.folder) description = '文件夹';
+  if (file.unavailable) description = file.size > maxFileSize ? '超过单文件 1 GiB 上限' : '文件无法读取';
+  const { row } = fileRow(file.name, description);
+  row.dataset.entry = file.id;
+  if (file.folder) {
+    const open = element('button', 'folder-open', file.name);
+    open.type = 'button';
+    open.setAttribute('aria-label', `打开文件夹 ${file.name}`);
+    row.querySelector('.file-name').replaceChildren(open);
+    row.classList.add('folder-row');
+    open.addEventListener('click', () => openFolder([...folderPath, file], true, true));
+    if (selectingFolder && root) row.append(folderCheckbox(file));
+    return row;
+  }
+  if (file.unavailable) return row;
+  const link = element('a', 'download', '下载');
+  link.href = root ? `/api/folders/${encodeURIComponent(root.id)}/download/${encodeURIComponent(file.id)}` :
+    `/api/download/${encodeURIComponent(file.id)}`;
+  link.download = file.name;
+  link.setAttribute('aria-label', `下载 ${file.name}`);
+  const error = element('p', 'download-error', '');
+  error.setAttribute('role', 'status');
+  error.hidden = true;
+  row.querySelector('.file-details').append(error);
+  link.addEventListener('click', async (event) => {
+    event.preventDefault();
+    if (link.getAttribute('aria-busy') === 'true') return;
+    link.setAttribute('aria-busy', 'true');
+    error.hidden = true;
+    try {
+      const response = await request(link.href, 'HEAD');
+      if (!response.ok) {
+        const details = {
+          403: '请重新配对后重试。',
+          404: '文件已移除或下载权限已关闭。',
+          409: '源文件已变动，请让电脑刷新目录。',
+          503: '电脑正在传输其他文件，稍后重试。',
+        };
+        error.textContent = details[response.status] || '暂时无法下载，请重试。';
+        error.hidden = false;
+        return;
+      }
+      const nativeDownload = link.cloneNode();
+      nativeDownload.hidden = true;
+      row.append(nativeDownload);
+      nativeDownload.click();
+      nativeDownload.remove();
+    } catch {
+      error.textContent = '与电脑的连接中断，请重试。';
+      error.hidden = false;
+    } finally { link.removeAttribute('aria-busy'); }
+  });
+  const actions = element('div', 'file-action');
+  if (file.preview && typeof byId('file-preview').showModal === 'function') {
+    const preview = element('button', '', '预览');
+    preview.type = 'button';
+    preview.setAttribute('aria-label', `预览 ${file.name}`);
+    preview.addEventListener('click', () => previewFile(file, link.href));
+    actions.append(preview);
+  }
+  actions.append(link);
+  if (selectingFolder && root) actions.prepend(folderCheckbox(file));
+  row.append(actions);
+  return row;
+}
+
+function folderCheckbox(file) {
+  const checkbox = element('input', 'folder-checkbox');
+  checkbox.type = 'checkbox';
+  checkbox.checked = selectedFolderEntries.has(file.id);
+  checkbox.setAttribute('aria-label', `选择 ${file.name}`);
+  checkbox.disabled = !checkbox.checked && selectedFolderEntries.size >= 80;
+  checkbox.addEventListener('change', () => {
+    if (checkbox.checked) selectedFolderEntries.add(file.id);
+    else selectedFolderEntries.delete(file.id);
+    for (const item of byId('download-list').querySelectorAll('.folder-checkbox')) {
+      item.disabled = !item.checked && selectedFolderEntries.size >= 80;
+    }
+    updateZipLink();
+  });
+  return checkbox;
+}
+
+function updateZipLink() {
+  const link = byId('folder-zip');
+  const root = folderPath[0];
+  const current = folderPath[folderPath.length - 1];
+  link.hidden = !current || (selectingFolder && !selectedFolderEntries.size);
+  if (link.hidden) return;
+  const href = new URL(`/api/folders/${root.id}/zip/${current.id}`, location.href);
+  if (selectingFolder) for (const id of selectedFolderEntries) href.searchParams.append('file', id);
+  link.href = href.href;
+  link.textContent = selectingFolder ? `下载所选 ${selectedFolderEntries.size} 项 ZIP` : '整目录 ZIP';
+}
+
+function renderFolder() {
+  const root = folderPath[0];
+  const current = folderPath[folderPath.length - 1];
+  const list = byId('download-list');
+  byId('folder-toolbar').hidden = !current;
+  byId('folder-filter').hidden = !current;
+  byId('folder-actions').hidden = !current || folderLoading || !!folderError;
+  byId('folder-select').setAttribute('aria-pressed', String(selectingFolder));
+  byId('folder-select').textContent = selectingFolder ? '取消多选' : '多选';
+  updateZipLink();
+  const crumbs = [element('button', '', '共享')];
+  crumbs[0].type = 'button';
+  crumbs[0].addEventListener('click', () => openFolder([], true, true));
+  folderPath.forEach(({ name }, index) => {
+    if (index === folderPath.length - 1) {
+      const active = element('span', '', name);
+      active.setAttribute('aria-current', 'location');
+      crumbs.push(active);
+    } else {
+      const link = element('button', '', name);
+      link.type = 'button';
+      link.addEventListener('click', () => openFolder(folderPath.slice(0, index + 1), true, true));
+      crumbs.push(link);
+    }
+  });
+  byId('folder-path').replaceChildren(...crumbs);
+  const entries = root ? folderEntries : sharedEntries;
+  const focus = list.contains(document.activeElement) ? document.activeElement.closest('[data-entry]')?.dataset.entry : '';
+  list.replaceChildren(...entries.map((entry) => downloadRow(entry, root)));
+  if (focus) [...list.children].find((row) => row.dataset.entry === focus)?.querySelector('button, a')?.focus({ preventScroll: true });
+  byId('folder-more').hidden = !root || entries.length >= folderTotal || !!folderError;
+  byId('folder-more').disabled = folderLoading;
+  byId('folder-retry').hidden = !folderError;
+  const empty = byId('no-files');
+  empty.hidden = entries.length > 0;
+  empty.textContent = !downloadAllowed ? '电脑关闭了文件下载权限。' : folderLoading ? '正在读取文件夹…' :
+    folderError || (current ? (byId('folder-search').value.trim() ? '没有匹配的文件或文件夹' : '此文件夹为空') : '暂无共享内容');
+}
+
+async function openFolder(path, focus = false, push = false, refresh = false, append = false) {
+  clearTimeout(folderSearchTimer);
+  const revision = ++folderRequest;
+  folderPath = path;
+  if (!refresh) {
+    folderEntries = [];
+    byId('folder-search').value = '';
+    folderTotal = 0;
+    selectingFolder = false;
+    selectedFolderEntries.clear();
+  }
+  folderError = '';
+  folderLoading = path.length > 0;
+  const nextState = { ...history.state, folder: path.map(({ id, name }) => ({ id, name })) };
+  if (push) history.pushState(nextState, '');
+  else history.replaceState(nextState, '');
+  if (!refresh || !path.length) renderFolder();
+  if (focus) byId(path.length ? 'folder-back' : 'download-title').focus();
+  if (!path.length) return;
+  byId('folder-more').disabled = true;
+  try {
+    const root = encodeURIComponent(path[0].id);
+    const directory = encodeURIComponent(path[path.length - 1].id);
+    const offset = append ? folderEntries.length : 0;
+    const params = new URLSearchParams({
+      offset: String(offset),
+      q: byId('folder-search').value.trim().slice(0, 100),
+      sort: byId('folder-sort').value,
+    });
+    const response = await request(`/api/folders/${root}/entries/${directory}?${params}`);
+    if (revision !== folderRequest) return;
+    if (response.status === 404) {
+      if (refresh) {
+        openFolder(path.slice(0, -1), false, false, true);
+        return;
+      }
+      folderError = '文件夹已移除或下载权限已关闭。';
+      return;
+    }
+    if (!response.ok) throw new Error('folder contents');
+    const entries = await response.json();
+    if (revision === folderRequest) {
+      folderEntries = append ? [...folderEntries, ...entries] : entries;
+      folderTotal = Number(response.headers.get('X-Folder-Count') ?? folderEntries.length);
+      if (!append && !params.get('q') && folderTotal <= folderPageSize) {
+        const available = new Set(entries.map(({ id }) => id));
+        for (const id of selectedFolderEntries) if (!available.has(id)) selectedFolderEntries.delete(id);
+      }
+    }
+  } catch {
+    if (revision === folderRequest) folderError = '无法读取文件夹，请重试。';
+  } finally {
+    if (revision === folderRequest) {
+      folderLoading = false;
+      renderFolder();
+    }
+  }
+}
+
+byId('folder-back').addEventListener('click', () => openFolder(folderPath.slice(0, -1), true, true));
+byId('folder-retry').addEventListener('click', () => openFolder(folderPath, true));
+window.addEventListener('popstate', (event) => {
+  const folder = event.state?.folder || [];
+  if (connection === 'approved') {
+    showTab('share');
+    openFolder(folder);
+  }
+});
+byId('folder-search').addEventListener('input', () => {
+  clearTimeout(folderSearchTimer);
+  folderSearchTimer = setTimeout(() => openFolder(folderPath, false, false, true), 220);
+});
+byId('folder-sort').addEventListener('change', () => openFolder(folderPath, false, false, true));
+byId('folder-select').addEventListener('click', () => {
+  selectingFolder = !selectingFolder;
+  selectedFolderEntries.clear();
+  renderFolder();
+});
+byId('folder-more').addEventListener('click', () => {
+  if (folderEntries.length < folderTotal) openFolder(folderPath, false, false, true, true);
+});
 
 async function copyText(value) {
   try {
@@ -196,11 +507,21 @@ async function copyText(value) {
   }
 }
 
-function showMessages(entries) {
-  const key = JSON.stringify(entries);
+function showMessages(entries, refresh = false) {
+  if (!refresh && tab !== 'sync') {
+    const previous = new Set(syncMessages.map((entry) => JSON.stringify(entry)));
+    unreadMessages += entries.filter((entry) => entry.desktop && !previous.has(JSON.stringify(entry))).length;
+    if (!entries.length) unreadMessages = 0;
+    byId('sync-unread').textContent = unreadMessages ? ` · ${unreadMessages}` : '';
+    byId('sync-unread').hidden = !unreadMessages;
+  }
+  syncMessages = entries;
+  const query = byId('sync-search').value.trim().toLocaleLowerCase();
+  const key = JSON.stringify([query, entries, sharedEntries.map(({ id }) => id)]);
   if (key === shownMessages) return;
   shownMessages = key;
-  byId('sync-list').replaceChildren(...entries.slice().reverse().map((entry) => {
+  byId('sync-list').replaceChildren(...entries.filter((entry) => entry.text.toLocaleLowerCase().includes(query))
+    .slice().reverse().map((entry) => {
     const row = element('li', 'file-row sync-entry');
     const content = element('div', 'file-details');
     const text = entry.text.trim();
@@ -213,7 +534,24 @@ function showMessages(entries) {
       body.target = '_blank';
       body.rel = 'noopener noreferrer';
     }
-    content.append(element('p', 'file-meta', entry.desktop ? '电脑' : '本机'), body);
+    const time = entry.sentAt ? ' · ' + new Date(entry.sentAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    content.append(element('p', 'file-meta', (entry.desktop ? '电脑' : '本机') + time));
+    if (entry.attachment) {
+      const href = '/api/text/attachment/' + encodeURIComponent(entry.attachment);
+      if (entry.attachmentType?.startsWith('image/')) {
+        const image = element('img', 'sync-image');
+        image.alt = entry.text;
+        image.loading = 'lazy';
+        image.src = href + '?preview=1';
+        content.append(image);
+      }
+      const download = element('a', 'download', '下载 ' + entry.text);
+      download.href = href;
+      download.download = entry.text;
+      content.append(download);
+    } else {
+      content.append(entry.attachment ? element('p', 'file-name', '图片 · ' + entry.text) : body);
+    }
     const copy = element('button', '', '复制');
     copy.type = 'button';
     copy.addEventListener('click', () => copyText(entry.text));
@@ -221,6 +559,33 @@ function showMessages(entries) {
     return row;
   }));
 }
+
+byId('sync-search').addEventListener('input', () => showMessages(syncMessages, true));
+byId('sync-latest').addEventListener('click', () => {
+  byId('sync-search').value = '';
+  showMessages(syncMessages, true);
+  byId('sync-list').firstElementChild?.scrollIntoView({ block: 'nearest' });
+});
+byId('sync-export').addEventListener('click', () => {
+  const lines = syncMessages.map((entry) => (entry.desktop ? '电脑' : '本机') + ' · ' + entry.text);
+  const url = URL.createObjectURL(new Blob([lines.join('\n\n')], { type: 'text/plain;charset=utf-8' }));
+  const link = element('a', '', '');
+  link.href = url;
+  link.download = 'TempShare-同步记录.txt';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+});
+byId('sync-clear').addEventListener('click', async () => {
+  if (!confirm('清空双方当前会话的同步记录？')) return;
+  try {
+    if (!(await request('/api/text', 'DELETE')).ok) throw new Error('clear');
+    showMessages([]);
+    knownTextRevision = -1;
+    poll();
+  } catch { message('无法清空同步记录，请重试。', true); }
+});
 
 async function sendText(event) {
   event.preventDefault();
@@ -249,6 +614,12 @@ function castStatus(text) {
   byId('cast-status').textContent = text;
 }
 
+function clearCastPicture() {
+  castVideo.hidden = true;
+  castCanvas.hidden = true;
+  byId('cast-placeholder').hidden = false;
+}
+
 function showCastAvailability(ready) {
   captureReady = ready;
   byId('cast-ready').hidden = !ready;
@@ -261,22 +632,104 @@ function clearCastPeer() {
   castPeer = undefined;
   previous?.close();
   castRevision = 0;
-  const video = byId('cast-video');
-  video.srcObject = null;
-  video.hidden = true;
+  castVideo.pause();
+  castVideo.srcObject = null;
+  castVideo.muted = true;
+  byId('cast-audio').hidden = true;
+  castVideo.tabIndex = -1;
+  lastVideoTime = -1;
+  lastVideoFrames = 0;
+  castVideo.hidden = true;
 }
 
 function stopViewing(notify = true) {
   const wasWatching = watching;
   const viewer = castViewer;
   watching = false;
+  updateScreenLock();
   castGeneration++;
+  clearTimeout(frameTimer);
+  frameTimer = undefined;
+  useFrames = false;
   clearCastPeer();
+  clearCastPicture();
+  castCanvas.width = 1;
+  castCanvas.height = 1;
   showCastAvailability(captureReady);
   byId('cast-watch').textContent = '开始观看';
+  byId('cast-mode').hidden = true;
+  byId('cast-fullscreen').hidden = true;
+  byId('resume-watching').hidden = true;
   if (notify && wasWatching) fetch('/api/cast/viewer', {
     method: 'POST', headers: { 'X-TempShare': '1', 'X-Cast-Watch': '0', 'X-Cast-Viewer': viewer }, keepalive: true,
   }).catch(() => {});
+}
+
+async function receiveFrame(generation) {
+  if (generation !== castGeneration || !useFrames) return;
+  try {
+    const response = await request('/api/cast/frame', 'GET', {
+      'X-Cast-Viewer': castViewer, 'X-Cast-After': frameSequence,
+    });
+    if (response.status === 200) {
+      const url = URL.createObjectURL(await response.blob());
+      try {
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        if (generation !== castGeneration) return;
+        if (castCanvas.width !== image.naturalWidth || castCanvas.height !== image.naturalHeight) {
+          castCanvas.width = image.naturalWidth;
+          castCanvas.height = image.naturalHeight;
+        }
+        castCanvas.getContext('2d').drawImage(image, 0, 0);
+        frameSequence = response.headers.get('X-Cast-Sequence') || '0';
+        lastFrameAt = Date.now();
+        castCanvas.hidden = false;
+        byId('cast-fullscreen').hidden = !document.fullscreenEnabled;
+        byId('cast-placeholder').hidden = true;
+        castStatus(`兼容播放 · ${castCanvas.width} × ${castCanvas.height} · 无音频`);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    }
+  } catch {
+    // 偶发丢帧由下一次请求恢复。
+  } finally {
+    if (generation === castGeneration && useFrames) {
+      if (Date.now() - lastFrameAt > 3500) {
+        clearCastPicture();
+        castStatus('正在等待电脑送出画面…');
+      }
+      frameTimer = setTimeout(() => receiveFrame(generation), 90);
+    }
+  }
+}
+
+function checkCastPlayback() {
+  if (!watching || useFrames) return;
+  if (castVideo.readyState >= 2 && castVideo.videoWidth && castVideo.currentTime > Math.max(0, lastVideoTime)) {
+    const quality = castVideo.getVideoPlaybackQuality?.();
+    const frames = quality ? quality.totalVideoFrames - quality.droppedVideoFrames : 0;
+    const now = Date.now();
+    const fps = lastVideoTime >= 0 && lastFrameAt && now > lastFrameAt && frames > lastVideoFrames
+      ? Math.round((frames - lastVideoFrames) * 1000 / (now - lastFrameAt)) : 0;
+    lastVideoFrames = frames;
+    lastVideoTime = castVideo.currentTime;
+    lastFrameAt = now;
+    castVideo.tabIndex = 0;
+    byId('cast-fullscreen').hidden = !document.fullscreenEnabled && !castVideo.webkitEnterFullscreen;
+    byId('cast-placeholder').hidden = true;
+    castStatus(`正在播放 · ${castVideo.videoWidth} × ${castVideo.videoHeight}${fps ? ` · ${fps} fps` : ''}`);
+  } else if (!castVideo.paused || lastVideoTime < 0) {
+    if (Date.now() - (lastFrameAt || castStarted) > 8500) {
+      useFrames = true;
+      byId('cast-mode').textContent = '重新尝试直连';
+      clearCastPeer();
+      clearCastPicture();
+      castStatus('正在切换到兼容播放…');
+    }
+  }
 }
 
 async function refreshCast() {
@@ -284,7 +737,10 @@ async function refreshCast() {
   const current = castGeneration;
   refreshingCast = true;
   try {
-    const response = await request('/api/cast/viewer', 'POST', { 'X-Cast-Watch': '1', 'X-Cast-Viewer': castViewer });
+    checkCastPlayback();
+    const response = await request('/api/cast/viewer', 'POST', {
+      'X-Cast-Watch': '1', 'X-Cast-Viewer': castViewer, 'X-Cast-Frames': useFrames ? '1' : '0',
+    });
     if (current !== castGeneration) return;
     if (response.status === 409) {
       stopViewing(false);
@@ -294,8 +750,17 @@ async function refreshCast() {
     if (!response.ok) throw new Error('viewer');
     const signal = await response.json();
     if (current !== castGeneration) return;
+    if (signal.frames) {
+      if (!frameTimer) {
+        frameSequence = '0';
+        lastFrameAt = Date.now();
+        frameTimer = setTimeout(() => receiveFrame(current), 0);
+      }
+      return;
+    }
     if (!signal.offer) {
       clearCastPeer();
+      clearCastPicture();
       if (!signal.ready) {
         stopViewing(false);
         showCastAvailability(false);
@@ -306,16 +771,25 @@ async function refreshCast() {
     }
     if (signal.revision === castRevision) return;
     clearCastPeer();
+    clearCastPicture();
     const peer = peerConnection();
     castPeer = peer;
     castRevision = signal.revision;
+    const media = new MediaStream();
     peer.addEventListener('track', (event) => {
       if (peer !== castPeer) return;
-      const video = byId('cast-video');
-      video.srcObject = event.streams[0] || new MediaStream([event.track]);
-      video.hidden = false;
-      video.play().catch(() => {});
-      castStatus('');
+      media.addTrack(event.track);
+      if (event.track.kind === 'audio') {
+        byId('cast-audio').hidden = false;
+        byId('cast-audio').textContent = castVideo.muted ? '取消静音' : '静音';
+      }
+      if (event.track.kind !== 'video') return;
+      castVideo.srcObject = media;
+      castVideo.hidden = false;
+      castVideo.play().catch(() => {
+        if (peer === castPeer) castStatus('正在等待画面，稍后会尝试兼容播放。');
+      });
+      castStatus('已收到视频轨道，正在等待首帧…');
     });
     peer.addEventListener('connectionstatechange', () => {
       if (peer === castPeer && peer.connectionState === 'failed') castStatus('媒体连接中断，正在等待电脑重连。');
@@ -326,16 +800,62 @@ async function refreshCast() {
     const result = await request('/api/cast/answer', 'POST', {
       'X-Cast-Revision': String(signal.revision), 'X-Cast-Viewer': castViewer,
     }, answer);
-    if (!result.ok) throw new Error('answer');
+    if (!result.ok) {
+      const error = await result.json();
+      if (peer === castPeer && error.code === 'no_lan_candidate') {
+        castStarted = Date.now() - 8501;
+      }
+      throw new Error('answer');
+    }
   } catch {
     if (current === castGeneration) {
       clearCastPeer();
+      clearCastPicture();
       castStatus('正在等待可用的局域网媒体连接。');
     }
   } finally {
     refreshingCast = false;
   }
 }
+
+function updateQueueSummary() {
+  const active = queue.filter((item) => !item.finished && !item.cancelled);
+  const failed = active.filter((item) => item.failed).length;
+  const finished = queue.filter((item) => item.finished && !item.cancelled).length;
+  byId('queue-shortcut').hidden = !queue.length || connection !== 'approved';
+  byId('queue-shortcut').textContent = `传输队列 · ${active.length}`;
+  byId('upload-summary').textContent = `${active.length} 个待处理 · ${failed} 个失败 · ${finished} 个已结束`;
+  byId('pause-uploads').disabled = !active.some((item) => item.approved && !item.failed);
+  byId('pause-uploads').textContent = active.some((item) => item.approved && !item.failed && !item.paused)
+    ? '暂停全部' : '继续全部';
+  byId('retry-uploads').disabled = !failed;
+  byId('clear-uploads').disabled = !queue.some((item) => item.finished || item.cancelled);
+  const images = queue.filter((item) => item.image && !item.cancelled);
+  const imageStatus = byId('sync-image-status');
+  imageStatus.hidden = !images.length;
+  if (images.length) imageStatus.textContent = `${images.filter((item) => item.finished).length} / ${images.length} 张图片已处理 · 详情见传输队列`;
+}
+
+byId('queue-shortcut').addEventListener('click', () => {
+  showTab('share');
+  byId('upload-title').focus();
+});
+byId('pause-uploads').addEventListener('click', () => {
+  const active = queue.filter((item) => item.approved && !item.finished && !item.cancelled && !item.failed);
+  const pause = active.some((item) => !item.paused);
+  active.filter((item) => !!item.paused !== pause).forEach((item) => item.pause.click());
+});
+byId('retry-uploads').addEventListener('click', () => queue.filter((item) => item.failed).forEach((item) => item.retry.click()));
+byId('clear-uploads').addEventListener('click', () => {
+  for (let index = queue.length - 1; index >= 0; index--) {
+    const item = queue[index];
+    if (!item.finished && !item.cancelled) continue;
+    item.row.remove();
+    queue.splice(index, 1);
+  }
+  byId('uploads').hidden = !queue.length;
+  updateQueueSummary();
+});
 
 function updateItem(item, status, progress, failed = false) {
   item.meta.textContent = `${formatSize(item.file.size)} · ${status}`;
@@ -347,7 +867,13 @@ function updateItem(item, status, progress, failed = false) {
   item.pause.textContent = item.paused ? '继续' : '暂停';
 }
 
-function submitFile(file, saved) {
+function submitFiles(files, image = false) {
+  const batch = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+    (value) => value.toString(16).padStart(2, '0')).join('');
+  Array.from(files).forEach((file) => submitFile(file, undefined, batch, image));
+}
+
+function submitFile(file, saved, batch = '', image = false, handle) {
   if (file.size > maxFileSize) {
     message(`${file.name} 超过 1 GiB，未加入队列。`, true);
     return;
@@ -370,12 +896,15 @@ function submitFile(file, saved) {
   progress.setAttribute('aria-label', `${file.name} 发送进度`);
   controls.append(retry, pause, cancel);
   row.append(controls, progress);
-  const item = { file, row, meta, progress, retry, pause, cancel, generation, offset: 0,
-    id: saved?.id, keep: byId('remember-uploads').checked && !byId('resume-option').hidden };
+  const directory = file.webkitRelativePath?.split('/').slice(0, -1).join('/') || '';
+  const item = { file, row, meta, progress, retry, pause, cancel, generation, offset: 0, batch, directory, image,
+    id: saved?.id, handle, attempts: 0, retryAt: 0, keep: byId('remember-uploads').checked && !byId('resume-option').hidden };
   queue.push(item);
   retry.addEventListener('click', () => {
     if (item.request || item.cancelled) return;
     if (item.id) {
+      item.attempts = 0;
+      item.retryAt = 0;
       item.failed = false;
       updateItem(item, '等待上传');
       knownOffersRevision = -1;
@@ -415,8 +944,7 @@ function showRecovery(offers) {
     input.type = 'file';
     input.setAttribute('aria-label', '恢复 ' + saved.name);
     meta.after(input);
-    input.addEventListener('change', async () => {
-      const [file] = input.files;
+    const recover = async (file) => {
       if (!file) return;
       const current = generation;
       input.disabled = true;
@@ -435,6 +963,19 @@ function showRecovery(offers) {
         input.value = '';
         input.disabled = false;
       }
+    };
+    input.addEventListener('change', () => recover(input.files[0]));
+    if (typeof window.showOpenFilePicker === 'function') savedHandle(saved.id).then((handle) => {
+      if (!handle) return;
+      const resume = element('button', '', '继续发送');
+      resume.type = 'button';
+      resume.addEventListener('click', async () => {
+        try {
+          if (await handle.requestPermission({ mode: 'read' }) !== 'granted') return input.click();
+          await recover(await handle.getFile());
+        } catch { message('无法读取原文件，请重新选择文件。', true); }
+      });
+      row.querySelector('.file-details').append(resume);
     });
     return row;
   }));
@@ -452,6 +993,9 @@ async function sendOffer(item) {
     const response = await request('/api/offers', 'POST', {
       'X-File-Name': encodeURIComponent(item.file.name),
       'X-File-Size': String(item.file.size),
+      'X-Upload-Batch': item.batch,
+      'X-Upload-Directory': encodeURIComponent(item.directory),
+      'X-Upload-Image': item.image ? '1' : '0',
     });
     if (!response.ok) throw new Error('offer');
     item.id = (await response.json()).id;
@@ -459,8 +1003,12 @@ async function sendOffer(item) {
     if (item.cancelled) {
       cancelItem(item);
     } else {
-      if (item.keep && !rememberUpload({ id: item.id, name: item.file.name, size: item.file.size, digest: item.digest })) {
-        message('浏览器无法保存续传记录，本次仍可上传。', true);
+      if (item.keep) {
+        if (!rememberUpload({ id: item.id, name: item.file.name, size: item.file.size, digest: item.digest })) {
+          message('浏览器无法保存续传记录，本次仍可上传。', true);
+        } else if (item.handle) {
+          await savedHandle(item.id, item.handle);
+        }
       }
       updateItem(item, '等待电脑确认');
     }
@@ -515,6 +1063,8 @@ function transfer(item) {
     item.request = undefined;
     if (item.cancelled || item.generation !== generation) return;
     if (xhr.status === 201) {
+      item.attempts = 0;
+      item.retryAt = 0;
       item.offset = end;
       if (end === item.file.size) {
         forgetUpload(item.id);
@@ -524,6 +1074,13 @@ function transfer(item) {
         transfer(item);
       }
     } else if (!item.paused) {
+      if ((xhr.status === 0 || xhr.status === 503) && item.attempts < 4) {
+        const retryAfter = Number(xhr.getResponseHeader('Retry-After')) || 0;
+        item.retryAt = Date.now() + 1000 * Math.min(30, Math.max(retryAfter, 2 ** item.attempts++));
+        knownOffersRevision = -1;
+        updateItem(item, '等待连接恢复，随后继续');
+        return;
+      }
       item.failed = true;
       let code;
       try { code = JSON.parse(xhr.responseText).code; } catch { /* Empty response after disconnect. */ }
@@ -550,9 +1107,9 @@ function syncUploads(offers) {
       item.finished = true;
       forgetUpload(item.id);
       updateItem(item, state === 'complete' ? '已保存到电脑' : '电脑已拒绝');
-    } else if (state === 'approved' && !item.failed && !item.paused) {
+    } else if (state === 'approved' && !item.failed && !item.paused && Date.now() >= item.retryAt) {
       item.approved = true;
-      item.offset = Math.max(item.offset, offer.transferred);
+      item.offset = offer.transferred;
       if (uploading < 3) {
         transfer(item);
         uploading++;
@@ -572,7 +1129,8 @@ async function poll() {
     if (attempt !== pairingAttempt) return;
     if (pair.status === 401) {
       forgetUpload();
-      showConnection('');
+      const error = await pair.json().catch(() => ({}));
+      if (attempt === pairingAttempt) showConnection('', '', error.code);
       return;
     }
     if (!pair.ok) {
@@ -583,19 +1141,24 @@ async function poll() {
       }
       throw new Error('pair');
     }
-    const { state, verification, upload, download, text, textRevision, castReady, filesRevision, offersRevision } = await pair.json();
+    const { state, verification, upload, download, text, textRevision, castReady, filesRevision, offersRevision,
+      computer, remainingSeconds } = await pair.json();
     if (attempt !== pairingAttempt) return;
+    computerName = computer || '';
+    sessionSeconds = remainingSeconds || 0;
     showConnection(state, verification);
     if (state !== 'approved') return;
     showCastAvailability(castReady === true);
     dropzone.hidden = !upload;
+    byId('select-resumable').hidden = !upload || byId('resume-option').hidden || typeof window.showOpenFilePicker !== 'function';
+    byId('directory-option').hidden = !upload || !('webkitdirectory' in byId('directory-input'));
     byId('upload-disabled').hidden = upload;
     byId('sync-image-label').hidden = !upload;
     byId('sync-form').hidden = !text;
     byId('sync-disabled').hidden = text;
-    const refreshText = text && tab === 'sync' && textRevision !== knownTextRevision;
+    const refreshText = text && textRevision !== knownTextRevision;
     const [files, offers, entries] = await Promise.all([
-      filesRevision === undefined || filesRevision !== knownFilesRevision ? request('/api/files') : null,
+      filesRevision === undefined || filesRevision !== knownFilesRevision ? request('/api/files?folders=1') : null,
       offersRevision === undefined || offersRevision !== knownOffersRevision ? request('/api/offers') : null,
       refreshText ? request('/api/text') : null,
     ]);
@@ -609,12 +1172,12 @@ async function poll() {
       files?.json(), offers?.json(), entries?.ok ? entries.json() : null,
     ]);
     if (attempt !== pairingAttempt) return;
+    downloadAllowed = download;
     if (downloads) {
       knownFilesRevision = filesRevision;
       showDownloads(downloads);
+      if (text && !history) showMessages(syncMessages, true);
     }
-    if (!download) byId('no-files').textContent = '电脑关闭了文件下载权限。';
-    else byId('no-files').textContent = '暂无共享文件';
     if (transfers) {
       knownOffersRevision = offersRevision;
       knownOffers = transfers;
@@ -650,6 +1213,11 @@ async function poll() {
 pairForm.addEventListener('submit', (event) => {
   event.preventDefault();
   askToPair(byId('pair-code').value);
+});
+byId('pair-code').addEventListener('input', (event) => {
+  const input = event.currentTarget;
+  input.value = input.value.normalize('NFKC').replace(/[^0-9]/g, '').slice(0, 6);
+  byId('code-length').textContent = input.value.length ? `${input.value.length} / 6 位` : '';
 });
 trustedConnect.addEventListener('click', async () => {
   if (pairing || connection) return;
@@ -696,25 +1264,99 @@ byId('disconnect').addEventListener('click', async (event) => {
 });
 byId('sync-image').addEventListener('change', (event) => {
   if (connection === 'approved') {
-    Array.from(event.target.files).forEach((file) => submitFile(file));
-    showTab('share');
+    submitFiles(event.target.files, true);
   }
   event.target.value = '';
 });
-byId('cast-watch').addEventListener('click', () => {
-  if (watching) return stopViewing();
-  if (typeof RTCPeerConnection === 'undefined') return castStatus('当前浏览器不支持 WebRTC。');
+function startViewing(compatibility = typeof RTCPeerConnection === 'undefined') {
   watching = true;
+  updateScreenLock();
+  castStarted = Date.now();
+  lastFrameAt = 0;
+  useFrames = compatibility;
   castViewer = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
   castGeneration++;
   byId('cast-watch').textContent = '停止观看';
+  byId('cast-mode').hidden = typeof RTCPeerConnection === 'undefined';
+  byId('cast-mode').textContent = compatibility ? '重新尝试直连' : '切换兼容播放';
   castStatus('等待电脑开始投递。');
   refreshCast();
+}
+byId('cast-watch').addEventListener('click', () => watching ? stopViewing() : startViewing());
+byId('cast-mode').addEventListener('click', async () => {
+  if (!watching) return;
+  const compatibility = !useFrames;
+  const viewer = castViewer;
+  stopViewing(false);
+  const pending = castGeneration;
+  try {
+    await request('/api/cast/viewer', 'POST', { 'X-Cast-Watch': '0', 'X-Cast-Viewer': viewer });
+    if (pending === castGeneration && connection === 'approved' && captureReady) startViewing(compatibility);
+  } catch {
+    castStatus('无法切换播放方式，请检查连接后重试。');
+  }
 });
+byId('resume-watching').addEventListener('click', () => showTab('cast'));
+byId('cast-fullscreen').addEventListener('click', async () => {
+  const stage = byId('cast-stage');
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else if (stage.requestFullscreen) await stage.requestFullscreen();
+    else castVideo.webkitEnterFullscreen?.();
+  } catch {
+    castStatus('当前浏览器无法进入全屏。');
+  }
+});
+byId('cast-audio').addEventListener('click', (event) => {
+  castVideo.muted = !castVideo.muted;
+  event.currentTarget.textContent = castVideo.muted ? '取消静音' : '静音';
+});
+byId('cast-awake-option').hidden = !navigator.wakeLock;
+async function updateScreenLock() {
+  if (!navigator.wakeLock) return;
+  if (!watching || document.hidden || !byId('cast-awake').checked) {
+    const lock = screenLock;
+    screenLock = undefined;
+    await lock?.release().catch(() => {});
+    return;
+  }
+  if (screenLock && !screenLock.released) return;
+  try {
+    const lock = await navigator.wakeLock.request('screen');
+    if (!watching || !byId('cast-awake').checked || document.hidden || (screenLock && !screenLock.released)) {
+      await lock.release();
+      return;
+    }
+    screenLock = lock;
+  } catch {
+    byId('cast-awake').checked = false;
+    message('当前设备无法保持亮屏。', true);
+  }
+}
+document.addEventListener('visibilitychange', updateScreenLock);
+byId('cast-awake').addEventListener('change', updateScreenLock);
 window.addEventListener('pagehide', () => stopViewing());
 fileInput.addEventListener('change', () => {
-  if (connection === 'approved') Array.from(fileInput.files).forEach((file) => submitFile(file));
+  if (connection === 'approved') submitFiles(fileInput.files);
   fileInput.value = '';
+});
+byId('directory-input').addEventListener('change', (event) => {
+  if (connection === 'approved') submitFiles(event.currentTarget.files);
+  event.currentTarget.value = '';
+});
+byId('select-resumable').addEventListener('click', async () => {
+  const current = generation;
+  try {
+    const handles = await window.showOpenFilePicker({ multiple: true });
+    const files = await Promise.all(handles.map((handle) => handle.getFile()));
+    if (current !== generation || connection !== 'approved') return;
+    byId('remember-uploads').checked = true;
+    const batch = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+      (value) => value.toString(16).padStart(2, '0')).join('');
+    files.forEach((file, index) => submitFile(file, undefined, batch, false, handles[index]));
+  } catch (error) {
+    if (error.name !== 'AbortError') message('文件选择器不可用，可使用普通文件选择。', true);
+  }
 });
 dropzone.addEventListener('dragover', (event) => {
   event.preventDefault();
@@ -724,7 +1366,7 @@ dropzone.addEventListener('dragleave', () => dropzone.classList.remove('active')
 dropzone.addEventListener('drop', (event) => {
   event.preventDefault();
   dropzone.classList.remove('active');
-  if (connection === 'approved') Array.from(event.dataTransfer.files).forEach((file) => submitFile(file));
+  if (connection === 'approved') submitFiles(event.dataTransfer.files);
 });
 
 async function start() {
@@ -739,3 +1381,4 @@ async function start() {
   setInterval(refreshCast, 900);
 }
 start();
+  updateQueueSummary();

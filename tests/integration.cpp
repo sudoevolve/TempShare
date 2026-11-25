@@ -170,6 +170,174 @@ void session_lifetime(const fs::path& path) {
     require(!session.authorized(pair->token) && !session.snapshot().active, "session expires");
 }
 
+void browsable_folders(const fs::path& path) {
+    const auto directory = path / fs::u8path(u8"共享资料");
+    const auto other = path / "other";
+    fs::create_directories(directory / "nested" / "empty");
+    fs::create_directories(directory / ".tempshare-partials");
+    fs::create_directories(other);
+    const auto file_name = fs::u8path(u8"选这份.txt");
+    std::ofstream(directory / "nested" / file_name) << "contents";
+    std::ofstream(directory / "root.txt") << "root file";
+    std::ofstream(other / "private.txt") << "separate share";
+    std::ofstream(directory / ".tempshare-partials" / "unfinished.part") << "unfinished upload";
+    std::error_code link_error;
+    fs::create_directory_symlink(other, directory / "link", link_error);
+
+    tempshare::Session session(path / "received");
+    tempshare::HttpServer server(session);
+    require(server.start(0, true), "start folder sharing server");
+    httplib::Client browser("127.0.0.1", server.port());
+    browser.set_read_timeout(2);
+    session.start();
+    const auto invitation = session.snapshot().invitation;
+    require(session.share_folder(invitation, directory) && session.share_folder(invitation, other),
+            "publish browsable folders");
+    require(!session.share_folder(invitation, directory / ".tempshare-partials"),
+            "do not publish the internal upload workspace");
+    require(session.share(directory / "root.txt"), "ordinary files still share separately");
+    const auto shared = session.snapshot().shared;
+    const auto root = shared[0].id;
+    const auto base = "/api/folders/" + root;
+    const auto root_listing = base + "/entries/" + root;
+    expect(browser.Get(root_listing), 403, "unauthenticated browser cannot list folders");
+    const auto pairing = session.pair(invitation);
+    require(pairing.has_value(), "request folder pairing");
+    const httplib::Headers auth{{"Cookie", "ts_" + std::to_string(server.port()) + "=" + pairing->token}};
+    expect(browser.Get(root_listing, auth), 403, "pending browser cannot list folders");
+    require(session.decide_pairing(pairing->token, true), "approve folder viewer");
+    const auto legacy = browser.Get("/api/files", auth);
+    expect(legacy, 200, "list files using the original API");
+    require(legacy->body.find(root) == std::string::npos && legacy->body.find(shared[2].id) != std::string::npos,
+            "original API only lists directly downloadable files");
+    const auto all = browser.Get("/api/files?folders=1", auth);
+    expect(all, 200, "list files and folders together");
+    require(all->body.find(root) != std::string::npos && all->body.find("\"folder\":true") != std::string::npos,
+            "folder is marked as browsable");
+    auto level = browser.Get(root_listing, auth);
+    expect(level, 200, "list first level");
+    require(level->body.find("nested") != std::string::npos && level->body.find("link") == std::string::npos &&
+            level->body.find("private.txt") == std::string::npos && level->body.find(file_name.u8string()) == std::string::npos,
+            "list immediate entries and omit linked directories");
+    const auto children = session.folder_contents(pairing->token, root, root);
+    require(children && children->size() == 2 && children->front().folder, "folders sort before files");
+    const auto nested = children->front().id;
+    level = browser.Get(base + "/entries/" + nested, auth);
+    expect(level, 200, "browse nested directory");
+    require(level->body.find(file_name.u8string()) != std::string::npos, "preserve Unicode file names");
+    const auto nested_children = session.folder_contents(pairing->token, root, nested);
+    require(nested_children && nested_children->size() == 2, "nested directory includes empty folder and file");
+    const auto empty = browser.Get(base + "/entries/" + nested_children->front().id, auth);
+    expect(empty, 200, "browse empty folder");
+    require(empty->body == "[]", "empty folder has a valid empty listing");
+    const auto child_id = nested_children->back().id;
+    const auto download = base + "/download/" + child_id;
+    const auto zip = browser.Get(base + "/zip/" + nested + "?file=" + child_id, auth);
+    expect(zip, 200, "zip selected folder children");
+    require(zip->body.rfind("PK", 0) == 0 && zip->body.find(file_name.u8string()) != std::string::npos &&
+            zip->body.find("/empty/") == std::string::npos, "zip includes selected child only");
+    expect(browser.Get(download), 403, "single-file download requires approval");
+    expect(browser.Get("/api/folders/" + shared[1].id + "/download/" + child_id, auth), 404,
+           "a descendant ID is scoped to the correct share");
+    expect(browser.Get("/api/download/" + root, auth), 404, "a folder has no direct download");
+    auto range = auth;
+    range.emplace("Range", "bytes=0-2");
+    const auto partial = browser.Get(download, range);
+    expect(partial, 206, "download one file using a range");
+    require(partial->body == "con", "download only the selected file");
+    std::ofstream(directory / "nested" / file_name, std::ios::app) << " updated";
+    expect(browser.Get(download, auth), 409, "changed descendant requires sharing again");
+    expect(browser.Head(download, auth), 409, "HEAD exposes an unavailable download before navigating");
+    require(session.share_folder(invitation, directory, root), "refresh an existing folder");
+    const auto refreshed = session.folder_contents(pairing->token, root, nested);
+    require(refreshed && refreshed->back().id != child_id, "refresh keeps the directory but replaces the changed file ID");
+    expect(browser.Get(download, auth), 404, "refresh revokes the old file link");
+    const auto new_download = base + "/download/" + refreshed->back().id;
+    expect(browser.Get(new_download + "?preview=1", auth), 200, "preview a text file after refresh");
+    session.set_permissions({false, true, true});
+    expect(browser.Get(root_listing, auth), 404, "disabling downloads hides folder contents");
+    expect(browser.Get(download, auth), 404, "disabling downloads revokes file access");
+    session.set_permissions({true, true, true});
+    session.unshare(root);
+    expect(browser.Get(root_listing, auth), 404, "removing a folder hides its listing");
+    expect(browser.Get(download, auth), 404, "removing a folder revokes existing links");
+}
+
+void upload_directories_and_history(const fs::path& path) {
+    const auto inbox = path / "history-inbox";
+    const auto history = path / "history-config" / "received-history";
+    fs::path received;
+    {
+        tempshare::Session session(inbox, {}, 30min, {}, history);
+        tempshare::HttpServer server(session);
+        require(server.start(0, true), "start nested upload server");
+        httplib::Client browser("127.0.0.1", server.port());
+        session.start();
+        const auto pairing = session.pair(session.snapshot().invitation, "Test Phone");
+        require(pairing && session.decide_pairing(pairing->token, true), "approve nested upload browser");
+        const httplib::Headers auth{{"Cookie", "ts_" + std::to_string(server.port()) + "=" + pairing->token},
+                                   {"X-TempShare", "1"}};
+        auto invalid = auth;
+        invalid.emplace("X-File-Name", "photo.txt");
+        invalid.emplace("X-File-Size", "5");
+        invalid.emplace("X-Upload-Directory", "%2e%2e%2foutside");
+        expect(browser.Post("/api/offers", invalid, "", "text/plain"), 409, "reject relative path traversal");
+        auto headers = auth;
+        headers.emplace("X-File-Name", "photo.txt");
+        headers.emplace("X-File-Size", "5");
+        headers.emplace("X-Upload-Directory", "album%2ftrip");
+        headers.emplace("X-Upload-Batch", std::string(32, 'a'));
+        expect(browser.Post("/api/offers", headers, "", "text/plain"), 201, "register folder entry");
+        const auto offer = session.snapshot().offers.back();
+        require(offer.batch == std::string(32, 'a') && session.decide_offer(offer.id, true), "approve file in batch");
+        expect(browser.Put("/api/upload/" + offer.id, auth, "hello", "application/octet-stream"), 201, "receive nested file");
+        const auto file = session.snapshot().received.back();
+        received = file.path;
+        require(received.parent_path().filename() == "trip" && received.parent_path().parent_path().filename() == "album",
+                "selected directory structure is preserved");
+        require(file.received_from == "Test Phone" && file.received_at > 0, "record sender and receive time");
+    }
+    tempshare::Session restored(inbox, {}, 30min, {}, history);
+    require(restored.snapshot().received.size() == 1 && restored.snapshot().received.front().path == received,
+            "receive history survives restart");
+    require(restored.clear_received() && fs::is_regular_file(received), "clearing history preserves files");
+    tempshare::Session cleared(inbox, {}, 30min, {}, history);
+    require(cleared.snapshot().received.empty(), "cleared history remains empty");
+}
+
+void independent_lan_connections(const fs::path& path) {
+    tempshare::Session first(path / "first-device");
+    tempshare::Session second(path / "second-device");
+    tempshare::HttpServer first_server(first);
+    tempshare::HttpServer second_server(second);
+    require(first_server.start(0, true) && second_server.start(0, true) && first_server.port() != second_server.port(),
+            "each LAN connection has an independent listener");
+    first.start();
+    second.start();
+    httplib::Client a("127.0.0.1", first_server.port());
+    httplib::Client b("127.0.0.1", second_server.port());
+    const auto one = first.pair(first.snapshot().invitation, "First device");
+    const auto two = second.pair(second.snapshot().invitation, "Second device");
+    require(one && two && first.decide_pairing(one->token, true) && second.decide_pairing(two->token, true),
+            "approve both devices");
+    const httplib::Headers a_cookie{{"Cookie", "ts_" + std::to_string(first_server.port()) + "=" + one->token}};
+    const httplib::Headers b_cookie{{"Cookie", "ts_" + std::to_string(second_server.port()) + "=" + two->token}};
+    expect(a.Get("/api/pair", a_cookie), 200, "first device is paired");
+    expect(b.Get("/api/pair", b_cookie), 200, "second device is paired");
+    expect(a.Get("/api/files", b_cookie), 403, "second device cannot read the first connection");
+    const auto file = path / "devices.txt";
+    std::ofstream(file) << "second connection only";
+    require(second.share(file), "share only with the second device");
+    const auto shared = second.snapshot().shared.back().id;
+    expect(a.Get("/api/download/" + shared, a_cookie), 404, "shared IDs stay in their own connection");
+    const auto available = b.Get("/api/download/" + shared, b_cookie);
+    expect(available, 200, "second device gets its own shared file");
+    require(available->body == "second connection only", "second connection file bytes are correct");
+    first.end();
+    expect(a.Get("/api/pair", a_cookie), 401, "first device disconnects independently");
+    expect(b.Get("/api/download/" + shared, b_cookie), 200, "second device continues downloading");
+}
+
 void network_changes(const fs::path& path) {
     const auto networks = tempshare::lan_networks();
     if (networks.empty()) return;
@@ -276,7 +444,36 @@ void lan_features(const fs::path& path) {
     answer.emplace("X-Cast-Revision", "1");
     expect(browser.Post("/api/cast/answer", answer, sdp, "text/plain"), 201, "accept current cast answer");
     expect(browser.Post("/api/cast/answer", answer, sdp, "text/plain"), 409, "reject duplicate cast answer");
+    expect(browser.Post("/api/cast/viewer", post, "", "text/plain"), 200, "release the direct viewer");
+    const std::string viewer(32, 'a');
+    auto frame_viewer = watching;
+    frame_viewer.emplace("X-Cast-Viewer", viewer);
+    frame_viewer.emplace("X-Cast-Frames", "1");
+    const auto fallback = browser.Post("/api/cast/viewer", frame_viewer, "", "text/plain");
+    expect(fallback, 200, "negotiate compatibility playback");
+    require(fallback->body.find("\"frames\":true") != std::string::npos, "compatibility playback enabled");
+    const auto playback = session.cast_host(cast_key);
+    require(playback && playback->frames && playback->offer.empty(), "desktop sees the compatibility viewer");
+    auto publish = host;
+    publish.emplace("X-Cast-Revision", std::to_string(playback->revision));
+    const std::string jpeg = "\xff\xd8" "test frame" "\xff\xd9";
+    expect(browser.Post("/api/cast/frame", publish, "invalid", "image/jpeg"), 400, "reject malformed frame");
+    expect(browser.Post("/api/cast/frame", publish, std::string(384 * 1024 + 1, 'x'), "image/jpeg"),
+           400, "reject oversized frame");
+    expect(browser.Post("/api/cast/frame", frame_viewer, jpeg, "image/jpeg"), 403, "viewer cannot publish");
+    expect(browser.Post("/api/cast/frame", publish, jpeg, "image/jpeg"), 204, "desktop publishes a frame");
+    expect(browser.Get("/api/cast/frame", auth), 403, "another tab cannot read frames");
+    auto read_frame = auth;
+    read_frame.emplace("X-Cast-Viewer", viewer);
+    const auto frame = browser.Get("/api/cast/frame", read_frame);
+    expect(frame, 200, "active viewer reads the latest frame");
+    require(frame->body == jpeg, "frame bytes unchanged");
+    const auto sequence = frame->get_header_value("X-Cast-Sequence");
+    require(!sequence.empty(), "frame has a sequence");
+    read_frame.emplace("X-Cast-After", sequence);
+    expect(browser.Get("/api/cast/frame", read_frame), 204, "skip previously displayed frame");
     expect(browser.Post("/api/cast/stop", host, "", "text/plain"), 204, "stop cast");
+    expect(browser.Get("/api/cast/frame", read_frame), 403, "stop revokes the last frame");
     expect(browser.Get("/api/cast/host", host), 403, "revoke cast console key");
     expect(browser.Post("/api/pair/trusted", post, "", "text/plain"), 403, "persistent device trust requires HTTPS");
     expect(browser.Delete("/api/pair", post), 204, "browser ends session");
@@ -356,8 +553,11 @@ void interaction_contracts(const fs::path& path) {
     require(session.cast_viewer(pair->token, true, other).has_value(), "a different tab can now watch");
     require(server.update_networks({{"192.168.20.10", 0xc0a8140a, 0xffffff00}}), "set casting subnet");
     const std::string elsewhere = "v=0\r\na=candidate:1 1 UDP 2122260223 192.168.21.10 50000 typ host\r\n";
-    expect(browser.Post("/api/cast/offer", host, elsewhere, "text/plain"), 409,
-           "cast ignores numeric candidates beyond the local subnet");
+    expect(browser.Post("/api/cast/offer", host, elsewhere, "text/plain"), 201,
+           "cast accepts candidates across routed private subnets");
+    const std::string public_candidate = "v=0\r\na=candidate:1 1 UDP 2122260223 203.0.113.10 50000 typ host\r\n";
+    expect(browser.Post("/api/cast/offer", host, public_candidate, "text/plain"), 409,
+           "cast rejects a public candidate");
     const std::string same_subnet = "v=0\r\na=candidate:1 1 UDP 2122260223 192.168.20.20 50000 typ host\r\n";
     expect(browser.Post("/api/cast/offer", host, same_subnet, "text/plain"), 201,
            "cast accepts a candidate within the local subnet");
@@ -474,6 +674,9 @@ int main() {
     try {
         Sandbox scratch;
         roundtrip(scratch.path);
+        browsable_folders(scratch.path);
+        upload_directories_and_history(scratch.path);
+        independent_lan_connections(scratch.path);
         session_lifetime(scratch.path);
         network_changes(scratch.path);
         lan_features(scratch.path);

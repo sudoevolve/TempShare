@@ -3,28 +3,36 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#15191b">
+  <meta name="theme-color" content="#101427">
   <title>TempShare</title>
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" type="module"></script>
+  <script src="/appearance.js" type="module"></script>
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
       <a class="brand" href="/" aria-label="TempShare 首页"><span aria-hidden="true">ϟ</span>TempShare</a>
       <div class="connection-actions">
-        <span id="connection" class="connection" aria-live="polite">未连接</span>
+        <select id="appearance" aria-label="外观">
+          <option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option>
+        </select>
         <button id="disconnect" type="button" hidden>断开</button>
       </div>
     </header>
 
+    <div class="device-summary">
+      <div class="device-emblem"><span class="device-icon" aria-hidden="true"></span></div>
+      <span id="connection" class="connection" aria-live="polite">未连接</span>
+    </div>
     <section id="connect-panel" class="hero" aria-labelledby="connect-title">
       <h1 id="connect-title">连接到电脑</h1>
       <p id="connect-description">输入电脑上显示的连接码。</p>
       <form id="pair-form">
         <label for="pair-code">连接码</label>
-        <input id="pair-code" name="code" inputmode="numeric" autocomplete="off" minlength="6" maxlength="6"
+        <input id="pair-code" name="code" inputmode="numeric" autocomplete="off" minlength="6"
                pattern="[0-9]{6}" placeholder="000000" required>
+        <output id="code-length" class="file-meta" aria-live="polite"></output>
         <button class="primary" type="submit">连接</button>
         <details class="device-details">
           <summary>更改设备名称</summary>
@@ -39,15 +47,33 @@
 
     <nav id="feature-nav" class="feature-nav" aria-label="功能" hidden>
       <button type="button" data-panel="share" aria-pressed="true">文件分享</button>
-      <button type="button" data-panel="sync" aria-pressed="false">内容同步</button>
-      <button type="button" data-panel="cast" aria-pressed="false">屏幕投递<span id="cast-ready" hidden> · 可观看</span></button>
+      <button type="button" data-panel="sync" aria-pressed="false">内容同步<span id="sync-unread" hidden></span></button>
+      <button type="button" data-panel="cast" aria-pressed="false">屏幕投递<span id="cast-ready" aria-label="可观看" hidden></span></button>
     </nav>
+    <button id="resume-watching" type="button" hidden>返回正在播放的投屏</button>
+    <button id="queue-shortcut" type="button" hidden>传输队列</button>
     <p id="message" class="message" role="status" hidden></p>
     <section id="share-panel" hidden>
       <section class="transfer-section" aria-labelledby="download-title">
-        <h1 id="download-title">从电脑接收</h1>
+        <h2 id="download-title" tabindex="-1">从电脑接收</h2>
+        <div id="folder-toolbar" class="folder-toolbar" hidden>
+          <button id="folder-back" type="button">返回</button>
+          <nav id="folder-path" aria-label="目录路径"></nav>
+        </div>
+        <div id="folder-filter" class="folder-toolbar" hidden>
+          <input id="folder-search" type="search" aria-label="查找此目录" placeholder="查找此目录">
+          <select id="folder-sort" aria-label="排序方式">
+            <option value="name">按名称</option><option value="size">按大小</option>
+          </select>
+        </div>
+        <div id="folder-actions" class="folder-toolbar" hidden>
+          <button id="folder-select" type="button" aria-pressed="false">多选</button>
+          <a id="folder-zip" class="download">整目录 ZIP</a>
+        </div>
         <ul id="download-list" class="file-list"></ul>
-        <p id="no-files" class="empty">暂无共享文件</p>
+        <p id="no-files" class="empty" role="status">暂无共享内容</p>
+        <button id="folder-more" type="button" hidden>显示更多</button>
+        <button id="folder-retry" type="button" hidden>重新加载</button>
       </section>
       <section class="transfer-section" aria-labelledby="send-title">
       <h2 id="send-title">发送到电脑</h2>
@@ -61,11 +87,21 @@
       <label id="resume-option" class="resume-option" hidden>
         <input id="remember-uploads" type="checkbox"> 允许本页刷新后重新选择文件续传
       </label>
+      <button id="select-resumable" type="button" hidden>选择可自动恢复的文件</button>
+      <label id="directory-option" class="image-picker" hidden>选择文件夹
+        <input id="directory-input" type="file" webkitdirectory multiple>
+      </label>
       <ul id="resume-list" class="file-list" aria-label="可恢复的文件"></ul>
       </section>
 
       <section id="uploads" class="transfer-section" aria-labelledby="upload-title" hidden>
-        <h2 id="upload-title">发送队列</h2>
+        <h2 id="upload-title" tabindex="-1">发送队列</h2>
+        <div class="queue-toolbar">
+          <span id="upload-summary" class="file-meta"></span>
+          <button id="pause-uploads" type="button">暂停全部</button>
+          <button id="retry-uploads" type="button">重试失败</button>
+          <button id="clear-uploads" type="button">清理完成</button>
+        </div>
         <ul id="upload-list" class="file-list" aria-label="发送队列"></ul>
       </section>
     </section>
@@ -80,14 +116,36 @@
       <label id="sync-image-label" class="image-picker">发送图片
         <input id="sync-image" type="file" accept="image/*" multiple>
       </label>
+      <div id="sync-tools" class="queue-toolbar">
+        <input id="sync-search" type="search" aria-label="搜索同步记录" placeholder="搜索同步记录">
+        <button id="sync-latest" type="button">最新</button>
+        <button id="sync-export" type="button">导出</button>
+        <button id="sync-clear" type="button">清空</button>
+      </div>
+      <p id="sync-image-status" class="message" role="status" hidden></p>
       <ul id="sync-list" class="file-list" aria-label="本会话的内容"></ul>
     </section>
     <section id="cast-panel" hidden>
       <div class="share-heading"><h1>屏幕投递</h1></div>
-      <video id="cast-video" class="cast-video" autoplay playsinline muted controls hidden></video>
+      <div id="cast-stage" class="cast-stage">
+        <video id="cast-video" class="cast-video" autoplay playsinline muted controls tabindex="-1" hidden></video>
+        <canvas id="cast-frames" class="cast-video" role="img" aria-label="共享屏幕画面" hidden></canvas>
+        <div id="cast-placeholder" class="cast-placeholder"><span class="device-icon" aria-hidden="true"></span>屏幕画面将在此播放</div>
+      </div>
       <p id="cast-status" class="message" role="status">等待电脑选择共享来源。</p>
       <button id="cast-watch" class="primary" type="button" disabled>开始观看</button>
+      <button id="cast-mode" type="button" hidden>切换兼容播放</button>
+      <button id="cast-fullscreen" type="button" hidden>全屏</button>
+      <button id="cast-audio" type="button" hidden>取消静音</button>
+      <label id="cast-awake-option" hidden><input id="cast-awake" type="checkbox"> 保持亮屏</label>
     </section>
   </main>
+  <dialog id="file-preview" aria-labelledby="preview-name">
+    <div class="preview-header">
+      <strong id="preview-name"></strong>
+      <button id="close-preview" type="button">关闭</button>
+    </div>
+    <div id="preview-content"></div>
+  </dialog>
 </body>
 </html>

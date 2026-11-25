@@ -32,6 +32,7 @@ struct LocalNetwork {
 };
 
 std::vector<LocalNetwork> lan_networks();
+std::string device_hostname();
 bool is_private_ipv4(const std::string& address);
 bool permits_private_lan_peer(const std::vector<LocalNetwork>& interfaces,
                               const std::string& local, const std::string& remote);
@@ -42,6 +43,7 @@ public:
               std::function<void()> changed);
     ~Discovery();
     std::vector<Peer> peers() const;
+    void refresh();
 
 private:
     void run();
@@ -57,6 +59,7 @@ private:
     std::function<std::vector<LocalNetwork>()> networks_;
     std::function<void()> changed_;
     std::atomic<bool> running_{true};
+    std::atomic<bool> refresh_{false};
     mutable std::mutex mutex_;
     std::vector<Seen> peers_;
     std::thread worker_;

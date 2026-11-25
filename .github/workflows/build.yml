@@ -32,7 +32,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
       - name: Check browser scripts
-        run: node --check src/web/app.js && node --check src/web/cast-host.js && node --check src/web/rtc.js && node --check src/web/resume.js
+        run: node --check src/web/app.js && node --check src/web/cast-host.js && node --check src/web/rtc.js && node --check src/web/resume.js && node --check src/web/appearance.js
       - name: Prepare binary and attribution files
         run: cmake --install build --config Release --prefix dist
       - uses: actions/upload-artifact@v4

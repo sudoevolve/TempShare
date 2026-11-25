@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdlib>
+#include <string_view>
 #include <thread>
 
 #ifdef _WIN32
@@ -10,6 +11,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shobjidl.h>
+#include <shlobj.h>
 #include <wrl/client.h>
 #elif defined(__APPLE__)
 #import <Cocoa/Cocoa.h>
@@ -19,6 +21,39 @@
 #include <sys/wait.h>
 extern char** environ;
 #endif
+
+std::optional<bool> system_dark_mode() {
+#ifdef _WIN32
+    DWORD light = 0;
+    DWORD size = sizeof(light);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size) == ERROR_SUCCESS) {
+        return light == 0;
+    }
+#elif defined(__APPLE__)
+    @autoreleasepool {
+        NSAppearance* appearance = NSApp.effectiveAppearance;
+        if (appearance) {
+            return [[appearance bestMatchFromAppearancesWithNames:
+                @[NSAppearanceNameAqua, NSAppearanceNameDarkAqua]] isEqualToString:NSAppearanceNameDarkAqua];
+        }
+    }
+#else
+    if (const auto* theme = std::getenv("GTK_THEME")) {
+        return std::string_view(theme).find("dark") != std::string_view::npos;
+    }
+    if (auto* pipe = popen("gsettings get org.gnome.desktop.interface color-scheme 2>/dev/null", "r")) {
+        char value[64]{};
+        const bool read = std::fgets(value, sizeof(value), pipe) != nullptr;
+        const int status = pclose(pipe);
+        if (read && status == 0) {
+            if (std::string_view(value).find("prefer-dark") != std::string_view::npos) return true;
+            return false;
+        }
+    }
+#endif
+    return std::nullopt;
+}
 
 std::vector<std::filesystem::path> choose_paths(bool directory, bool* failed) {
     if (failed) *failed = false;
@@ -136,6 +171,24 @@ bool open_folder(const std::filesystem::path& directory) {
 #endif
 }
 
+bool reveal_file(const std::filesystem::path& file) {
+#ifdef _WIN32
+    const auto native = ILCreateFromPathW(file.c_str());
+    if (!native) return false;
+    const auto result = SHOpenFolderAndSelectItems(native, 0, nullptr, 0);
+    ILFree(native);
+    return SUCCEEDED(result);
+#elif defined(__APPLE__)
+    @autoreleasepool {
+        NSString* path = [NSString stringWithUTF8String:file.c_str()];
+        [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[[NSURL fileURLWithPath:path]]];
+        return true;
+    }
+#else
+    return open_folder(file.parent_path());
+#endif
+}
+
 std::filesystem::path configuration_directory() {
 #ifdef _WIN32
     const DWORD required = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
@@ -158,6 +211,72 @@ std::filesystem::path configuration_directory() {
 
 #ifdef _WIN32
 namespace {
+constexpr UINT tray_message = WM_APP + 114;
+
+NOTIFYICONDATAW tray_data(HWND window) {
+    NOTIFYICONDATAW data{};
+    data.cbSize = sizeof(data);
+    data.hWnd = window;
+    data.uID = 1;
+    return data;
+}
+
+bool add_tray(HWND window) {
+    auto data = tray_data(window);
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    data.uCallbackMessage = tray_message;
+    data.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
+    if (!data.hIcon) data.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    lstrcpynW(data.szTip, L"TempShare", ARRAYSIZE(data.szTip));
+    return Shell_NotifyIconW(NIM_ADD, &data);
+}
+
+void reveal(HWND window) {
+    ShowWindow(window, SW_RESTORE);
+    SetForegroundWindow(window);
+}
+
+LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
+    auto& desktop = *reinterpret_cast<DesktopIntegration*>(ref);
+    if (msg == desktop.taskbar_created) {
+        desktop.tray = add_tray(window);
+        if (!desktop.tray) reveal(window);
+    }
+    if (msg == WM_SYSCOMMAND && (wp & 0xfff0) == SC_MINIMIZE && desktop.tray) {
+        desktop.minimize();
+        return 0;
+    }
+    if (msg == tray_message) {
+        if (lp == WM_LBUTTONUP || lp == NIN_BALLOONUSERCLICK) reveal(window);
+        if (lp == WM_RBUTTONUP) {
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            if (const auto menu = CreatePopupMenu()) {
+                AppendMenuW(menu, MF_STRING, 1, L"打开 TempShare");
+                AppendMenuW(menu, MF_STRING, 2, L"打开接收目录");
+                AppendMenuW(menu, MF_STRING, 3, L"检查更新");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, 4, L"退出");
+                SetForegroundWindow(window);
+                const auto action = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                                                   cursor.x, cursor.y, 0, window, nullptr);
+                DestroyMenu(menu);
+                PostMessageW(window, WM_NULL, 0, 0);
+                switch (action) {
+                case 1: reveal(window); break;
+                case 2: if (!desktop.inbox.empty()) open_folder(desktop.inbox); break;
+                case 3: desktop.updates(); break;
+                case 4: PostMessageW(window, WM_CLOSE, 0, 0); break;
+                default: break;
+                }
+            }
+        }
+        return 0;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(window, tray_callback, id);
+    return DefSubclassProc(window, msg, wp, lp);
+}
+
 LRESULT CALLBACK drop_callback(HWND window, UINT message, WPARAM wparam, LPARAM lparam, UINT_PTR id,
                                DWORD_PTR data) {
     if (message == WM_DROPFILES) {
@@ -180,18 +299,72 @@ LRESULT CALLBACK drop_callback(HWND window, UINT message, WPARAM wparam, LPARAM 
     return DefSubclassProc(window, message, wparam, lparam);
 }
 
-BOOL CALLBACK attach_drop(HWND window, LPARAM data) {
+BOOL CALLBACK find_window(HWND window, LPARAM data) {
     wchar_t title[32]{};
     GetWindowTextW(window, title, 32);
     if (std::wstring(title) != L"TempShare") return TRUE;
-    if (SetWindowSubclass(window, drop_callback, 1, static_cast<DWORD_PTR>(data))) {
-        DragAcceptFiles(window, TRUE);
-    }
+    *reinterpret_cast<HWND*>(data) = window;
     return FALSE;
 }
 }
 
-void enable_file_drop(std::vector<std::filesystem::path>& paths) {
-    EnumThreadWindows(GetCurrentThreadId(), attach_drop, reinterpret_cast<LPARAM>(&paths));
+DesktopIntegration::DesktopIntegration(std::vector<std::filesystem::path>& paths) {
+    HWND native = nullptr;
+    EnumThreadWindows(GetCurrentThreadId(), find_window, reinterpret_cast<LPARAM>(&native));
+    if (!native) return;
+    window = native;
+    if (SetWindowSubclass(native, drop_callback, 1, reinterpret_cast<DWORD_PTR>(&paths))) DragAcceptFiles(native, TRUE);
+    taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
+    if (SetWindowSubclass(native, tray_callback, 2, reinterpret_cast<DWORD_PTR>(this))) tray = add_tray(native);
+}
+
+DesktopIntegration::~DesktopIntegration() {
+    const auto native = static_cast<HWND>(window);
+    if (!native) return;
+    if (tray) {
+        auto data = tray_data(native);
+        Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+    RemoveWindowSubclass(native, tray_callback, 2);
+    RemoveWindowSubclass(native, drop_callback, 1);
+}
+
+void DesktopIntegration::minimize() const {
+    if (window) ShowWindow(static_cast<HWND>(window), tray ? SW_HIDE : SW_MINIMIZE);
+}
+
+void DesktopIntegration::notify(const std::wstring& title, const std::wstring& message) const {
+    if (!tray) return;
+    auto data = tray_data(static_cast<HWND>(window));
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    lstrcpynW(data.szInfoTitle, title.c_str(), ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, message.c_str(), ARRAYSIZE(data.szInfo));
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
+bool DesktopIntegration::updates(bool automatic) const {
+    wchar_t executable[32768]{};
+    const auto count = GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+    if (!count || count == ARRAYSIZE(executable)) return false;
+    const auto app = std::filesystem::path(executable);
+    const auto script = app.parent_path() / "update.ps1";
+    std::error_code ignored;
+    if (!std::filesystem::is_regular_file(script, ignored)) {
+        return !automatic && open_url("https://github.com/sudoevolve/TempShare/releases");
+    }
+    wchar_t system[32768]{};
+    if (!GetSystemDirectoryW(system, ARRAYSIZE(system))) return false;
+    const auto powershell = std::filesystem::path(system) / "WindowsPowerShell/v1.0/powershell.exe";
+    auto arguments = L"\"" + powershell.wstring() + L"\" -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -WindowStyle Hidden -File \"" +
+        script.wstring() + L"\" -InstalledVersion " TEMPSHARE_WIDE_VERSION + (automatic ? L" -Automatic" : L"");
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(powershell.c_str(), arguments.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &startup, &process)) return false;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
 }
 #endif
