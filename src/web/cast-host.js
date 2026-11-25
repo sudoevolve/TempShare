@@ -34,6 +34,9 @@ let nextOffer = 0;
 let negotiatingSince = 0;
 let frameRevision = 0;
 let sendingFrame = false;
+let frameInterval = 42;
+let nextFrameAt = 0;
+let frameScale = 1;
 const frameCanvas = document.createElement('canvas');
 const frameContext = frameCanvas.getContext('2d', { alpha: false });
 
@@ -92,7 +95,7 @@ async function updateSender(sender) {
   if (!encoding) return;
   const { width = 1920, height = 1080, frameRate = 30 } = sender.track.getSettings();
   encoding.maxBitrate = Math.round(Math.min(36e6, Math.max(2e6, width * height * frameRate * 0.075)));
-  parameters.degradationPreference = 'maintain-resolution';
+  parameters.degradationPreference = sender.track.contentHint === 'detail' ? 'maintain-resolution' : 'balanced';
   try { await sender.setParameters(parameters); } catch { /* 浏览器仍可使用自动码率控制。 */ }
 }
 
@@ -100,6 +103,7 @@ async function applySettings() {
   const video = stream?.getVideoTracks()[0];
   if (video) {
     try {
+      if ('contentHint' in video) video.contentHint = byId('cast-profile').value === 'clear' ? 'detail' : 'motion';
       await video.applyConstraints(settings());
       updateCaptureInfo();
       await updateSender(peer?.getSenders().find((sender) => sender.track === video));
@@ -126,7 +130,6 @@ async function capture() {
     stream = media;
     lastStream?.getTracks().forEach((track) => track.stop());
     const video = stream.getVideoTracks()[0];
-    if ('contentHint' in video) video.contentHint = 'detail';
     video.addEventListener('ended', () => {
       if (stream === media) end('投递已停止。', true);
     }, { once: true });
@@ -157,7 +160,7 @@ async function negotiate() {
   const current = peerConnection();
   peer = current;
   negotiatingSince = Date.now();
-  for (const track of stream.getTracks()) current.addTrack(track, stream);
+  for (const track of stream.getTracks()) current.addTransceiver(track, { direction: 'sendonly', streams: [stream] });
   current.addEventListener('connectionstatechange', () => {
     if (current !== peer) return;
     if (current.connectionState === 'connected') status('已连接观看设备。');
@@ -181,10 +184,12 @@ async function negotiate() {
 
 async function publishFrame() {
   if (!frameRevision || sendingFrame || preview.readyState < 2 || !preview.videoWidth || !frameContext) return;
+  const started = performance.now();
+  if (started < nextFrameAt) return;
   const revision = frameRevision;
   sendingFrame = true;
   try {
-    const scale = Math.min(1, 1280 / preview.videoWidth, 720 / preview.videoHeight);
+    const scale = Math.min(1, 1280 / preview.videoWidth, 720 / preview.videoHeight) * frameScale;
     const width = Math.max(1, Math.round(preview.videoWidth * scale));
     const height = Math.max(1, Math.round(preview.videoHeight * scale));
     if (frameCanvas.width !== width || frameCanvas.height !== height) {
@@ -192,16 +197,22 @@ async function publishFrame() {
       frameCanvas.height = height;
     }
     frameContext.drawImage(preview, 0, 0, width, height);
-    let frame = await new Promise((resolve) => frameCanvas.toBlob(resolve, 'image/jpeg', .67));
-    if (frame?.size > 384 * 1024) {
-      frame = await new Promise((resolve) => frameCanvas.toBlob(resolve, 'image/jpeg', .40));
-    }
+    const frame = await new Promise((resolve) => frameCanvas.toBlob(resolve, 'image/jpeg', .64));
     if (revision === frameRevision && frame && frame.size <= 384 * 1024) {
-      await host('frame', frame, { 'X-Cast-Revision': String(revision), 'Content-Type': 'image/jpeg' });
+      const response = await host('frame', frame, { 'X-Cast-Revision': String(revision), 'Content-Type': 'image/jpeg' });
+      if (response.ok) {
+        const elapsed = performance.now() - started;
+        frameInterval = elapsed > 66 ? 58 : 42;
+        if (elapsed > 85 || frame.size > 192 * 1024) frameScale = Math.max(.5, frameScale * .90);
+        else if (elapsed < 36 && frame.size < 90 * 1024) frameScale = Math.min(1, frameScale + .025);
+      }
+    } else if (frame?.size > 384 * 1024) {
+      frameScale = Math.max(.5, frameScale * .75);
     }
   } catch {
-    // 下一帧继续尝试，控制请求负责判断会话是否仍然有效。
+    frameInterval = 80;
   } finally {
+    nextFrameAt = Math.max(started + frameInterval, performance.now());
     sendingFrame = false;
   }
 }
@@ -218,7 +229,13 @@ async function tick() {
     if (!response.ok) throw new Error('cast host');
     failures = 0;
     const signal = await response.json();
-    frameRevision = signal.frames ? signal.revision : 0;
+    const revision = signal.frames ? signal.revision : 0;
+    if (revision !== frameRevision) {
+      frameRevision = revision;
+      frameInterval = 42;
+      frameScale = 1;
+      nextFrameAt = 0;
+    }
     if (!stream) {
       start.disabled = capturing;
       return;
@@ -240,7 +257,7 @@ async function tick() {
     } else if (signal.answer && peer?.signalingState === 'have-local-offer') {
       await peer.setRemoteDescription({ type: 'answer', sdp: signal.answer });
       await updateSender(peer?.getSenders().find((sender) => sender.track?.kind === 'video'));
-    } else if (peer && peer.connectionState !== 'connected' && Date.now() - negotiatingSince > 12000) {
+    } else if (peer && peer.connectionState !== 'connected' && Date.now() - negotiatingSince > 17000) {
       closePeer();
       nextOffer = Date.now() + 1200;
     }
@@ -280,6 +297,6 @@ else if (!navigator.mediaDevices?.getDisplayMedia || typeof RTCPeerConnection ==
 } else {
   await tick();
   if (!ended && failures === 0) start.disabled = false;
-  setInterval(tick, 900);
-  setInterval(publishFrame, 100);
+  setInterval(tick, 500);
+  setInterval(publishFrame, 12);
 }

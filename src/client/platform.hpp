@@ -19,12 +19,18 @@ public:
     ~DesktopIntegration();
     DesktopIntegration(const DesktopIntegration&) = delete;
     DesktopIntegration& operator=(const DesktopIntegration&) = delete;
-    void notify(const std::wstring& title, const std::wstring& message) const;
+    bool notify(const std::wstring& title, const std::wstring& message, int connection, bool open_sync = false);
     void minimize() const;
     bool updates(bool automatic = false) const;
     std::filesystem::path inbox;
     void* window = nullptr;
     unsigned taskbar_created = 0;
     bool tray = false;
+    bool allow_exit = false;
+    bool close_prompt = false;
+    int notice_connection = -1;
+    int clicked_connection = -1;
+    bool notice_opens_sync = false;
+    bool clicked_sync = false;
 };
 #endif

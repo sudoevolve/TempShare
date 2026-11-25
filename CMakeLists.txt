@@ -32,6 +32,10 @@ foreach(asset IN ITEMS index.html styles.css app.js appearance.js cast.html cast
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${path}")
     file(READ "${path}" "${asset}")
 endforeach()
+set(icon "${CMAKE_CURRENT_SOURCE_DIR}/src/web/icon.png")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${icon}")
+file(READ "${icon}" icon_hex HEX)
+string(REGEX REPLACE "(..)" "0x\\1," icon_bytes "${icon_hex}")
 configure_file(src/core/web_assets.hpp.in generated/web_assets.hpp @ONLY)
 
 add_library(tempshare_core STATIC src/core/session.cpp src/core/http_server.cpp src/core/discovery.cpp
@@ -55,6 +59,8 @@ target_include_directories(tempshare SYSTEM PRIVATE "${aino_SOURCE_DIR}" "${qrco
 target_link_libraries(tempshare PRIVATE tempshare_core Threads::Threads)
 
 if(WIN32)
+    enable_language(RC)
+    target_sources(tempshare PRIVATE packaging/windows/tempshare.rc)
     set_target_properties(tempshare PROPERTIES WIN32_EXECUTABLE TRUE)
     if(MINGW)
         target_link_options(tempshare PRIVATE -municode)

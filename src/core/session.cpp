@@ -22,7 +22,7 @@
 namespace tempshare {
 namespace {
 
-constexpr auto cast_timeout = std::chrono::seconds(8);
+constexpr auto cast_timeout = std::chrono::seconds(22);
 constexpr std::string_view upload_workspace = ".tempshare-partials";
 
 bool is_upload_workspace(std::string_view name) {
@@ -453,7 +453,7 @@ bool Session::set_directory(std::filesystem::path directory) {
 
 NotificationState Session::notification_state() const {
     std::lock_guard lock(mutex_);
-    NotificationState result{directory_, {}, {}, received_.empty() ? std::string{} : received_.back().id};
+    NotificationState result{directory_, {}, {}, received_.empty() ? std::string{} : received_.back().id, incoming_messages_};
     if (!active()) return result;
     if (pairing_ && pairing_->state == State::pending) result.pairing = pairing_->token;
     const auto pending = std::find_if(offers_.rbegin(), offers_.rend(), [](const Offer& offer) {
@@ -1092,6 +1092,7 @@ bool Session::add_message(std::string text, bool from_desktop) {
     if (messages_.size() >= 50) messages_.erase(messages_.begin());
     messages_.push_back({std::move(text), from_desktop, unix_seconds()});
     ++text_revision_;
+    if (!from_desktop) ++incoming_messages_;
     return true;
 }
 
@@ -1163,6 +1164,7 @@ void Session::reset_cast_signal() {
     cast_viewer_id_.clear();
     cast_frame_.jpeg.clear();
     cast_frame_at_ = {};
+    cast_frame_changed_.notify_all();
 }
 
 std::string Session::open_cast() {
@@ -1284,18 +1286,30 @@ bool Session::publish_cast_frame(std::string_view token, unsigned revision, std:
     const auto now = Clock::now();
     if (!cast_available() || !cast_host_access(token) || !cast_.frames || cast_.revision != revision ||
         now - cast_viewer_seen_ >= cast_timeout) return false;
-    if (now - cast_frame_at_ < std::chrono::milliseconds(80)) return true;
+    if (now - cast_frame_at_ < std::chrono::milliseconds(32)) return true;
     cast_frame_.jpeg = std::move(jpeg);
     ++cast_frame_.sequence;
     cast_frame_at_ = now;
+    cast_frame_changed_.notify_all();
     return true;
 }
 
-std::optional<CastFrame> Session::cast_frame(std::string_view token, std::string_view viewer, std::uint64_t after) const {
-    std::lock_guard lock(mutex_);
+std::optional<CastFrame> Session::cast_frame(std::string_view token, std::string_view viewer, std::uint64_t after,
+                                            Clock::duration wait) const {
+    std::unique_lock lock(mutex_);
+    const auto authorized = [&] {
+        return has_access(token) && cast_available() && cast_.frames && viewer == cast_viewer_id_ &&
+            Clock::now() - cast_viewer_seen_ < cast_timeout;
+    };
+    const auto has_frame = [&] {
+        return cast_frame_.sequence > after && Clock::now() - cast_frame_at_ < std::chrono::seconds(2);
+    };
+    if (!authorized()) return {};
+    if (!has_frame() && wait > Clock::duration::zero()) {
+        cast_frame_changed_.wait_for(lock, wait, [&] { return !authorized() || has_frame(); });
+    }
+    if (!authorized()) return {};
     const auto now = Clock::now();
-    if (!has_access(token) || !cast_available() || !cast_.frames || viewer != cast_viewer_id_ ||
-        now - cast_viewer_seen_ >= cast_timeout) return {};
     if (cast_frame_.sequence <= after || now - cast_frame_at_ >= std::chrono::seconds(2)) return CastFrame{};
     return cast_frame_;
 }

@@ -13,6 +13,9 @@
 #include <shobjidl.h>
 #include <shlobj.h>
 #include <wrl/client.h>
+#ifdef _MSC_VER
+#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#endif
 #elif defined(__APPLE__)
 #import <Cocoa/Cocoa.h>
 #else
@@ -234,11 +237,34 @@ bool add_tray(HWND window) {
 void reveal(HWND window) {
     ShowWindow(window, SW_RESTORE);
     SetForegroundWindow(window);
+    InvalidateRect(window, nullptr, FALSE);
+}
+
+int close_choice(HWND window, bool tray) {
+    const TASKDIALOG_BUTTON choices[] = {{IDYES, L"缩小到托盘"}, {IDNO, L"退出 TempShare"}};
+    TASKDIALOGCONFIG dialog{};
+    dialog.cbSize = sizeof(dialog);
+    dialog.hwndParent = window;
+    dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    dialog.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    dialog.pszWindowTitle = L"TempShare";
+    dialog.pszMainInstruction = L"关闭 TempShare";
+    dialog.pszContent = tray ? L"缩小到托盘后，当前连接、传输和投屏会继续。退出会结束这些任务。"
+                              : L"退出会结束当前连接、传输和投屏。";
+    dialog.pButtons = tray ? choices : choices + 1;
+    dialog.cButtons = tray ? 2 : 1;
+    dialog.nDefaultButton = tray ? IDYES : IDCANCEL;
+    int choice = IDCANCEL;
+    if (SUCCEEDED(TaskDialogIndirect(&dialog, &choice, nullptr, nullptr))) return choice;
+    const int answer = MessageBoxW(window, tray ? L"是：缩小到托盘\n否：退出并结束当前连接\n取消：返回窗口"
+                                               : L"退出 TempShare 并结束当前连接？",
+                                   L"TempShare", (tray ? MB_YESNOCANCEL : MB_YESNO) | MB_ICONQUESTION);
+    return tray ? answer : answer == IDYES ? IDNO : IDCANCEL;
 }
 
 LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
     auto& desktop = *reinterpret_cast<DesktopIntegration*>(ref);
-    if (msg == desktop.taskbar_created) {
+    if (desktop.taskbar_created && msg == desktop.taskbar_created) {
         desktop.tray = add_tray(window);
         if (!desktop.tray) reveal(window);
     }
@@ -246,7 +272,19 @@ LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT
         desktop.minimize();
         return 0;
     }
+    if (msg == WM_CLOSE && !desktop.allow_exit) {
+        if (desktop.close_prompt) return 0;
+        desktop.close_prompt = true;
+        const auto choice = close_choice(window, desktop.tray);
+        desktop.close_prompt = false;
+        if (choice == IDYES && desktop.tray) desktop.minimize();
+        if (choice != IDNO) return 0;
+    }
     if (msg == tray_message) {
+        if (lp == NIN_BALLOONUSERCLICK) {
+            desktop.clicked_connection = desktop.notice_connection;
+            desktop.clicked_sync = desktop.notice_opens_sync;
+        }
         if (lp == WM_LBUTTONUP || lp == NIN_BALLOONUSERCLICK) reveal(window);
         if (lp == WM_RBUTTONUP) {
             POINT cursor{};
@@ -266,7 +304,7 @@ LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT
                 case 1: reveal(window); break;
                 case 2: if (!desktop.inbox.empty()) open_folder(desktop.inbox); break;
                 case 3: desktop.updates(); break;
-                case 4: PostMessageW(window, WM_CLOSE, 0, 0); break;
+                case 4: desktop.allow_exit = true; PostMessageW(window, WM_CLOSE, 0, 0); break;
                 default: break;
                 }
             }
@@ -313,6 +351,11 @@ DesktopIntegration::DesktopIntegration(std::vector<std::filesystem::path>& paths
     EnumThreadWindows(GetCurrentThreadId(), find_window, reinterpret_cast<LPARAM>(&native));
     if (!native) return;
     window = native;
+    if (const auto icon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1))) {
+        SendMessageW(native, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon));
+        SendMessageW(native, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon));
+    }
+    SetCurrentProcessExplicitAppUserModelID(L"sudoevolve.TempShare");
     if (SetWindowSubclass(native, drop_callback, 1, reinterpret_cast<DWORD_PTR>(&paths))) DragAcceptFiles(native, TRUE);
     taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     if (SetWindowSubclass(native, tray_callback, 2, reinterpret_cast<DWORD_PTR>(this))) tray = add_tray(native);
@@ -333,14 +376,17 @@ void DesktopIntegration::minimize() const {
     if (window) ShowWindow(static_cast<HWND>(window), tray ? SW_HIDE : SW_MINIMIZE);
 }
 
-void DesktopIntegration::notify(const std::wstring& title, const std::wstring& message) const {
-    if (!tray) return;
+bool DesktopIntegration::notify(const std::wstring& title, const std::wstring& message, int connection, bool open_sync) {
+    if (!tray) return false;
     auto data = tray_data(static_cast<HWND>(window));
     data.uFlags = NIF_INFO;
     data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
     lstrcpynW(data.szInfoTitle, title.c_str(), ARRAYSIZE(data.szInfoTitle));
     lstrcpynW(data.szInfo, message.c_str(), ARRAYSIZE(data.szInfo));
-    Shell_NotifyIconW(NIM_MODIFY, &data);
+    if (!Shell_NotifyIconW(NIM_MODIFY, &data)) return false;
+    notice_connection = connection;
+    notice_opens_sync = open_sync;
+    return true;
 }
 
 bool DesktopIntegration::updates(bool automatic) const {

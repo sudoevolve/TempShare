@@ -24,7 +24,7 @@ export async function gather(peer, description) {
       const update = () => {
         if (peer.iceGatheringState === 'complete' || peer.signalingState === 'closed') complete();
       };
-      const timeout = setTimeout(complete, 4200);
+      const timeout = setTimeout(complete, 2500);
       peer.addEventListener('icegatheringstatechange', update);
       update();
     });

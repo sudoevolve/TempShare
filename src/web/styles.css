@@ -72,17 +72,8 @@ button:disabled { opacity: .56; cursor: default; }
   border-bottom: 1px solid var(--line);
 }
 .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--ink); font-size: 17px; font-weight: 720; text-decoration: none; }
-.brand span {
-  display: grid;
-  place-items: center;
-  width: 31px;
-  height: 31px;
-  border-radius: 9px;
-  color: #fff;
-  background: linear-gradient(140deg, #34a6f6, #6842eb 78%);
-  font-size: 22px;
-  line-height: 1;
-}
+.brand img { width: 34px; height: 34px; }
+#sync-alert { margin-top: 10px; color: var(--accent); }
 .connection-actions { display: flex; align-items: center; gap: 7px; }
 .connection-actions button, #appearance { min-height: 32px; padding: 4px 7px; font-size: 12px; }
 .device-summary { display: grid; justify-items: center; gap: 11px; margin-block: 31px 17px; }

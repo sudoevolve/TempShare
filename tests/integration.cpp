@@ -372,7 +372,9 @@ void lan_features(const fs::path& path) {
     expect(browser.Post("/api/text", {{"X-TempShare", "1"}}, "hello", "text/plain"),
            403, "unauthorized browser cannot send text");
     require(session.send_text("https://example.test/path"), "desktop sends a link");
+    require(session.notification_state().incoming_messages == 0, "local text does not notify the desktop");
     expect(browser.Post("/api/text", post, u8"中文\ncode()", "text/plain"), 201, "browser sends multiline text");
+    require(session.notification_state().incoming_messages == 1, "browser text signals a desktop notification");
     const auto entries = browser.Get("/api/text", auth);
     expect(entries, 200, "read text history");
     require(entries->body.find("code()") != std::string::npos && session.snapshot().messages.size() == 2,
@@ -471,6 +473,19 @@ void lan_features(const fs::path& path) {
     const auto sequence = frame->get_header_value("X-Cast-Sequence");
     require(!sequence.empty(), "frame has a sequence");
     read_frame.emplace("X-Cast-After", sequence);
+    auto wait_frame = read_frame;
+    wait_frame.emplace("X-Cast-Wait", "1");
+    auto next_frame = std::async(std::launch::async, [&] {
+        httplib::Client waiting("127.0.0.1", server.port());
+        return waiting.Get("/api/cast/frame", wait_frame);
+    });
+    std::this_thread::sleep_for(40ms);
+    expect(browser.Post("/api/cast/frame", publish, jpeg, "image/jpeg"), 204, "publish the waiting viewer's next frame");
+    const auto next = next_frame.get();
+    expect(next, 200, "a waiting viewer receives the next frame");
+    require(next->get_header_value("X-Cast-Sequence") != sequence, "push only a new frame");
+    read_frame.erase("X-Cast-After");
+    read_frame.emplace("X-Cast-After", next->get_header_value("X-Cast-Sequence"));
     expect(browser.Get("/api/cast/frame", read_frame), 204, "skip previously displayed frame");
     expect(browser.Post("/api/cast/stop", host, "", "text/plain"), 204, "stop cast");
     expect(browser.Get("/api/cast/frame", read_frame), 403, "stop revokes the last frame");

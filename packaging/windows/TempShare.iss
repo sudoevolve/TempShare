@@ -24,6 +24,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutputPath}
 OutputBaseFilename=TempShare-{#AppVersion}-windows-x64
 LicenseFile=..\..\LICENSE
+SetupIconFile=tempshare.ico
 UninstallDisplayIcon={app}\bin\tempshare.exe
 Compression=lzma2
 SolidCompression=yes
@@ -35,7 +36,7 @@ RestartApplications=no
 Source: "{#StagingDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{autoprograms}\TempShare"; Filename: "{app}\bin\tempshare.exe"; WorkingDir: "{localappdata}\TempShare"
+Name: "{autoprograms}\TempShare"; Filename: "{app}\bin\tempshare.exe"; WorkingDir: "{localappdata}\TempShare"; AppUserModelID: "sudoevolve.TempShare"
 Name: "{autoprograms}\Uninstall TempShare"; Filename: "{uninstallexe}"
 
 [Dirs]

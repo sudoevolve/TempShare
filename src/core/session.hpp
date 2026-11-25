@@ -3,6 +3,7 @@
 #include "core/shared_source.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -116,6 +117,7 @@ struct NotificationState {
     std::string pairing;
     std::string offer;
     std::string received;
+    std::uint64_t incoming_messages = 0;
 };
 
 struct FolderProgress {
@@ -179,7 +181,8 @@ public:
     bool cast_offer(std::string_view token, std::string sdp);
     bool cast_answer(std::string_view token, unsigned revision, std::string sdp, std::string_view viewer = {});
     bool publish_cast_frame(std::string_view token, unsigned revision, std::string jpeg);
-    std::optional<CastFrame> cast_frame(std::string_view token, std::string_view viewer, std::uint64_t after) const;
+    std::optional<CastFrame> cast_frame(std::string_view token, std::string_view viewer, std::uint64_t after,
+                                       Clock::duration wait = {}) const;
 
     std::optional<Pairing> pair(std::string_view invitation, std::string name = "浏览器");
     std::optional<Pairing> reconnect(std::string_view trusted);
@@ -253,9 +256,11 @@ private:
     Permissions permissions_;
     std::vector<Message> messages_;
     std::uint64_t text_revision_ = 0;
+    std::uint64_t incoming_messages_ = 0;
     std::string cast_token_;
     CastSignal cast_;
     CastFrame cast_frame_;
+    mutable std::condition_variable cast_frame_changed_;
     Clock::time_point cast_frame_at_{};
     unsigned cast_revision_ = 0;
     Clock::time_point cast_host_seen_{};

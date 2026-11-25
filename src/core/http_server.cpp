@@ -92,20 +92,25 @@ std::string cast_json(const CastSignal& signal) {
 }
 
 // mDNS host candidates remain opaque to the service. A LAN may route multiple private subnets.
+bool mdns_address(std::string_view address) {
+    return address.size() > 6 && address.substr(address.size() - 6) == ".local" &&
+        address.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.") == std::string_view::npos;
+}
+
 bool lan_address(const std::string& address, std::string_view expected_peer) {
-    if (address.size() > 6 && address.substr(address.size() - 6) == ".local") {
-        return address.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.") ==
-            std::string_view::npos;
-    }
+    if (mdns_address(address)) return true;
     return is_private_ipv4(address) && (expected_peer.empty() || expected_peer == address);
 }
 
-std::string lan_sdp(const std::string& body, std::string_view expected_peer = {}) {
+std::string lan_sdp(const std::string& body, const std::string& private_endpoint = {}, bool restrict_numeric = false) {
     if (body.rfind("v=0", 0) != 0 || body.find('\0') != std::string::npos) return {};
     std::istringstream stream(body);
     std::string line;
     std::string result;
     bool candidate = false;
+    unsigned aliases = 0;
+    const bool can_alias = is_private_ipv4(private_endpoint);
+    const std::string_view expected_peer = restrict_numeric ? private_endpoint : std::string_view{};
     while (std::getline(stream, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.rfind("a=candidate:", 0) == 0) {
@@ -114,6 +119,15 @@ std::string lan_sdp(const std::string& body, std::string_view expected_peer = {}
             if (!(fields >> foundation >> component >> protocol >> priority >> address >> port >> type >> host) ||
                 type != "typ" || host != "host" || !lan_address(address, expected_peer)) continue;
             candidate = true;
+            // The TCP endpoint provides a fallback when the browsers cannot resolve each other's mDNS names.
+            if (can_alias && mdns_address(address) && (protocol == "udp" || protocol == "UDP") && component == "1" &&
+                aliases < 24) {
+                const auto candidate_port = number(port);
+                if (candidate_port && *candidate_port && *candidate_port <= 65535) {
+                    result += "a=candidate:ts" + std::to_string(++aliases) + " 1 udp 2122260222 " +
+                        private_endpoint + ' ' + std::to_string(*candidate_port) + " typ host\r\n";
+                }
+            }
         }
         if (line.rfind("c=IN ", 0) == 0) line = "c=IN IP4 0.0.0.0";
         if (line.rfind("a=rtcp:", 0) == 0 || line.rfind("a=remote-candidates:", 0) == 0) continue;
@@ -213,6 +227,9 @@ using CookieName = std::function<std::string()>;
 using Authorize = std::function<std::string(const Request&)>;
 
 void register_pages(httplib::Server& server) {
+    server.Get("/icon.png", [](const Request&, Response& response) {
+        response.set_content(reinterpret_cast<const char*>(web::icon), sizeof(web::icon), "image/png");
+    });
     server.Get("/", [](const Request&, Response& response) { response.set_content(web::index, "text/html; charset=utf-8"); });
     server.Get("/styles.css", [](const Request&, Response& response) { response.set_content(web::styles, "text/css; charset=utf-8"); });
     server.Get("/app.js", [](const Request&, Response& response) { response.set_content(web::script, "text/javascript; charset=utf-8"); });
@@ -334,17 +351,18 @@ void register_cast(httplib::Server& server, Session& session, const Authorize& a
     server.Post("/api/cast/viewer", [&session, auth](const Request& request, Response& response) {
         const auto token = auth(request);
         if (!session.authorized(token)) return fail(response, 403, "Connection approval required");
-        const auto signal = session.cast_viewer(token, request.get_header_value("X-Cast-Watch") == "1",
+        auto signal = session.cast_viewer(token, request.get_header_value("X-Cast-Watch") == "1",
                                                request.get_header_value("X-Cast-Viewer"),
                                                request.get_header_value("X-Cast-Frames") == "1");
         if (!signal) return fail(response, 409, "Another viewer is active", "viewer_busy");
+        if (!signal->offer.empty() && !local_socket(request)) signal->offer = lan_sdp(signal->offer, request.local_addr);
         response.set_content(cast_json(*signal), json);
     });
     server.Post("/api/cast/answer", [&session, auth](const Request& request, Response& response) {
         const auto token = auth(request);
         if (!session.authorized(token)) return fail(response, 403, "Connection approval required");
         const auto revision = number(request.get_header_value("X-Cast-Revision"));
-        auto answer = lan_sdp(request.body, local_socket(request) ? std::string_view{} : request.remote_addr);
+        auto answer = local_socket(request) ? lan_sdp(request.body) : lan_sdp(request.body, request.remote_addr, true);
         if (answer.empty()) return fail(response, 409, "No private ICE candidate", "no_lan_candidate");
         if (!revision || *revision > std::numeric_limits<unsigned>::max() ||
             !session.cast_answer(token, static_cast<unsigned>(*revision), std::move(answer),
@@ -368,9 +386,13 @@ void register_cast(httplib::Server& server, Session& session, const Authorize& a
         }
         response.status = 204;
     });
-    server.Get("/api/cast/frame", [&session, auth](const Request& request, Response& response) {
+    const auto frame_wait = std::make_shared<std::mutex>();
+    server.Get("/api/cast/frame", [&session, auth, frame_wait](const Request& request, Response& response) {
         const auto after = number(request.get_header_value("X-Cast-After")).value_or(0);
-        auto frame = session.cast_frame(auth(request), request.get_header_value("X-Cast-Viewer"), after);
+        std::unique_lock wait(*frame_wait, std::defer_lock);
+        const bool wait_for_frame = request.get_header_value("X-Cast-Wait") == "1" && wait.try_lock();
+        auto frame = session.cast_frame(auth(request), request.get_header_value("X-Cast-Viewer"), after,
+                                        std::chrono::milliseconds(wait_for_frame ? 800 : 0));
         if (!frame) return fail(response, 403, "Active frame viewer required");
         if (frame->jpeg.empty()) {
             response.status = 204;

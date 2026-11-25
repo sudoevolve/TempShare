@@ -44,5 +44,6 @@
 - 已配对的观看端向 `POST /api/cast/viewer` 发送 `X-Cast-Watch: 1`，并为当前观看操作生成一个 32 位十六进制值，放在 `X-Cast-Viewer` 中。定期刷新；退出时携带同一标识和 `X-Cast-Watch: 0`。活跃租约被其他标签页占用时返回 409。旧客户端可沿用无 `X-Cast-Viewer` 的单观看者流程。
 - `POST /api/cast/answer` 带同一观看标识及 `X-Cast-Revision`，正文为 SDP。信令由桌面端提供，媒体经浏览器间的 WebRTC 流传输。
 - 观看端可在刷新租约时带上 `X-Cast-Frames: 1` 请求兼容播放，并通过返回的 `frames` 字段确认。控制台使用本机授权和当前 `X-Cast-Revision` 向 `POST /api/cast/frame` 提交不超过 384 KiB 的 JPEG。已配对的观看端携带原租约标识从 `GET /api/cast/frame` 获取单帧，可用 `X-Cast-After` 传入上次响应的 `X-Cast-Sequence`。无更新时返回 204。
+- 兼容播放可以加 `X-Cast-Wait: 1` 等待下一帧，最多 800 毫秒。每个连接同时允许一个等待请求。
 
 [局域网 HTTPS 与设备验收](lan-https.md)

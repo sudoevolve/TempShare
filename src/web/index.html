@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101427">
   <title>TempShare</title>
+  <link rel="icon" href="/icon.png">
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" type="module"></script>
   <script src="/appearance.js" type="module"></script>
@@ -12,7 +13,7 @@
 <body>
   <main class="shell">
     <header class="topbar">
-      <a class="brand" href="/" aria-label="TempShare 首页"><span aria-hidden="true">ϟ</span>TempShare</a>
+      <a class="brand" href="/" aria-label="TempShare 首页"><img src="/icon.png" alt="">TempShare</a>
       <div class="connection-actions">
         <select id="appearance" aria-label="外观">
           <option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option>
@@ -50,6 +51,7 @@
       <button type="button" data-panel="sync" aria-pressed="false">内容同步<span id="sync-unread" hidden></span></button>
       <button type="button" data-panel="cast" aria-pressed="false">屏幕投递<span id="cast-ready" aria-label="可观看" hidden></span></button>
     </nav>
+    <button id="sync-alert" type="button" hidden aria-live="polite">收到新消息 · 查看</button>
     <button id="resume-watching" type="button" hidden>返回正在播放的投屏</button>
     <button id="queue-shortcut" type="button" hidden>传输队列</button>
     <p id="message" class="message" role="status" hidden></p>

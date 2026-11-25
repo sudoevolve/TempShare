@@ -154,6 +154,7 @@ struct View {
     std::string draft;
     std::string previous_invitation;
     std::size_t message_page = 0;
+    std::uint64_t last_read_messages = 0;
     std::size_t device_page = 0;
     std::future<std::string> folder_job;
     std::thread folder_worker;
@@ -287,7 +288,8 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                 }
                 if (button(ui, "拒绝", {qr_left + 134, top + 184, 104, 34})) session.decide_pairing(pairing.token, false);
             } else {
-                label(ui, "已连接", {qr_left + 18, top + 97, 220, 26}, 13, online, true);
+                label(ui, "已连接", {qr_left + 18, top + 97, 220, 24}, 13, online, true);
+                if (!networks.empty()) label(ui, url, {qr_left + 18, top + 117, 220, 21}, 12, muted);
                 const auto waiting = std::count_if(snapshot.offers.begin(), snapshot.offers.end(),
                     [](const tempshare::Offer& offer) { return offer.state == State::pending; });
                 if (waiting && button(ui, std::to_string(waiting) + " 个文件待接收",
@@ -310,27 +312,26 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                 label(ui, "没有可用的局域网地址", {qr_left + 18, top + 60, 220, 32}, 15, text, true);
                 label(ui, "请连接与手机相同的网络", {qr_left + 18, top + 97, 220, 25}, 12, muted);
             } else {
-                draw_qr(ui, *view.qr, {qr_left + 40, top + 38, 176, 176});
+                draw_qr(ui, *view.qr, {qr_left + 48, top + 36, 160, 160});
             }
             if (!networks.empty()) {
-                const auto link = url + " · " + (current->wireless ? "Wi-Fi" : "以太网");
-                ui.draw_text(link, {qr_left + 12, top + 215, 232, 21}, muted, Style().center().font(11));
-                ui.draw_text("连接码  " + snapshot.code, {qr_left + 18, top + 238, 220, 24},
-                             text, Style().center().font(15).semi_bold());
-            }
-            if (!networks.empty() && button(ui, "复制链接", {qr_left + 18, top + 265, networks.size() > 1 ? 102.f : 220.f, 28})) {
-                view.status = window.try_set_clipboard(invitation) ? "邀请链接已复制" : "无法写入剪贴板";
-            }
-            if (networks.size() > 1) {
-                std::vector<std::string> choices;
-                for (const auto& network : networks) {
-                    choices.push_back(network.address + " · " + (network.interface_name.empty()
-                        ? (network.wireless ? "Wi-Fi" : "以太网") : network.interface_name));
+                if (networks.size() > 1) {
+                    std::vector<std::string> choices;
+                    for (const auto& network : networks) choices.push_back(server.url(network.address));
+                    int index = static_cast<int>(std::distance(networks.begin(), current));
+                    if (ui.select(choices, &index, {qr_left + 18, top + 202, 220, 30}, Style().font(13))) {
+                        view.selected_address = networks[static_cast<std::size_t>(index)].address;
+                        window.wake();
+                    }
+                } else {
+                    ui.draw_text(url, {qr_left + 18, top + 202, 220, 30}, text, Style().center().font(13));
                 }
-                int index = static_cast<int>(std::distance(networks.begin(), current));
-                if (ui.select(choices, &index, {qr_left + 132, top + 265, 106, 28}, Style().font(11))) {
-                    view.selected_address = networks[static_cast<std::size_t>(index)].address;
-                    window.wake();
+                const auto adapter = current->interface_name.empty() ? (current->wireless ? "Wi-Fi" : "局域网")
+                                                                    : current->interface_name;
+                ui.draw_text(adapter, {qr_left + 18, top + 232, 220, 19}, muted, Style().center().font(11));
+                label(ui, "连接码 " + snapshot.code, {qr_left + 18, top + 263, 114, 28}, 13, text, true);
+                if (button(ui, "复制邀请链接", {qr_left + 140, top + 263, 98, 28})) {
+                    view.status = window.try_set_clipboard(invitation) ? "邀请链接已复制" : "无法写入剪贴板";
                 }
             }
         }
@@ -908,6 +909,17 @@ int run(const Options& options) {
 
     try {
         window.run([&](Ui& ui) {
+#ifdef _WIN32
+            if (desktop.clicked_connection >= 0 && desktop.clicked_connection < static_cast<int>(connections.size())) {
+                auto& target = connections[static_cast<std::size_t>(desktop.clicked_connection)];
+                if (target) {
+                    selected_connection = desktop.clicked_connection;
+                    if (desktop.clicked_sync) target->view.page = View::Page::sync;
+                    else target->view.connection_open = true;
+                }
+                desktop.clicked_connection = -1;
+            }
+#endif
             const auto connection = connections[static_cast<std::size_t>(selected_connection)];
             auto& session = connection->session;
             auto& http = connection->http;
@@ -938,16 +950,20 @@ int run(const Options& options) {
                 if (!config_path.empty() && std::filesystem::is_regular_file(automatic_updates, error)) desktop.updates(true);
             }
             desktop.inbox = session.notification_state().directory;
-            for (const auto& item : connections) {
+            for (std::size_t i = 0; i < connections.size(); ++i) {
+                const auto& item = connections[i];
                 if (!item) continue;
+                const auto slot = static_cast<int>(i);
                 const auto notification = item->session.notification_state();
                 const auto& last = item->last_notice;
                 if (notification.pairing != last.pairing && !notification.pairing.empty()) {
-                    desktop.notify(L"TempShare · 连接请求", L"切换到待确认的连接，核对手机验证码。");
+                    desktop.notify(L"TempShare · 连接请求", L"点击核对手机上的验证码。", slot);
                 } else if (notification.received != last.received && !notification.received.empty()) {
-                    desktop.notify(L"TempShare · 文件已接收", L"文件已保存，点击打开 TempShare。");
+                    desktop.notify(L"TempShare · 文件已接收", L"文件已保存，点击打开 TempShare。", slot);
                 } else if (notification.offer != last.offer && !notification.offer.empty()) {
-                    desktop.notify(L"TempShare · 文件接收请求", L"打开 TempShare 查看并确认待接收文件。");
+                    desktop.notify(L"TempShare · 文件接收请求", L"点击查看并确认待接收文件。", slot);
+                } else if (notification.incoming_messages != last.incoming_messages) {
+                    desktop.notify(L"TempShare · 新消息", L"点击打开内容同步。", slot, true);
                 }
                 item->last_notice = notification;
             }
@@ -996,6 +1012,8 @@ int run(const Options& options) {
                 SystemIcon::Play, SystemIcon::Network, SystemIcon::Download, SystemIcon::People, SystemIcon::Settings};
             constexpr float nav_top = 81, nav_step = 40, nav_height = 34, group_gap = 16;
             constexpr std::size_t group_start = 4;
+            const auto incoming_messages = session.notification_state().incoming_messages;
+            if (view.page == View::Page::sync) view.last_read_messages = incoming_messages;
             for (std::size_t i = 0; i < titles.size(); ++i) {
                 const auto page = pages[i];
                 const float y = nav_top + nav_step * static_cast<float>(i) + (i >= group_start ? group_gap : 0);
@@ -1009,6 +1027,9 @@ int run(const Options& options) {
                     view.status.clear();
                 }
                 ui.system_icon(icons[i], {navigation_inset + 14, y + 9, 16, 16}, selected ? white : muted);
+                if (page == View::Page::sync && incoming_messages > view.last_read_messages) {
+                    ui.fill_circle(side_width - 25, y + 17, 3.5f, accent);
+                }
             }
             constexpr float divider = nav_top + nav_step * group_start + (group_gap + nav_height - nav_step) / 2;
             ui.fill_rect({23, divider, side_width - 46, 1}, border);

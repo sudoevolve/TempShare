@@ -49,12 +49,15 @@ let refreshingCast = false;
 let captureReady = false;
 let screenLock;
 let castStarted = 0;
+let castAnsweredAt = 0;
 let lastVideoTime = -1;
 let lastFrameAt = 0;
 let lastVideoFrames = 0;
 let useFrames = false;
 let frameSequence = '0';
 let frameTimer;
+let framesInWindow = 0;
+let frameWindowAt = 0;
 const castVideo = byId('cast-video');
 const castCanvas = byId('cast-frames');
 let shownRecovery = '';
@@ -140,6 +143,7 @@ function showTab(feature) {
   if (tab === 'sync') {
     unreadMessages = 0;
     byId('sync-unread').hidden = true;
+    byId('sync-alert').hidden = true;
   }
   for (const button of byId('feature-nav').querySelectorAll('[data-panel]')) {
     const selected = button.dataset.panel === tab;
@@ -514,6 +518,8 @@ function showMessages(entries, refresh = false) {
     if (!entries.length) unreadMessages = 0;
     byId('sync-unread').textContent = unreadMessages ? ` · ${unreadMessages}` : '';
     byId('sync-unread').hidden = !unreadMessages;
+    byId('sync-alert').hidden = !unreadMessages;
+    byId('sync-alert').textContent = `收到 ${unreadMessages} 条新消息 · 查看`;
   }
   syncMessages = entries;
   const query = byId('sync-search').value.trim().toLocaleLowerCase();
@@ -561,6 +567,7 @@ function showMessages(entries, refresh = false) {
 }
 
 byId('sync-search').addEventListener('input', () => showMessages(syncMessages, true));
+byId('sync-alert').addEventListener('click', () => showTab('sync'));
 byId('sync-latest').addEventListener('click', () => {
   byId('sync-search').value = '';
   showMessages(syncMessages, true);
@@ -639,6 +646,7 @@ function clearCastPeer() {
   castVideo.tabIndex = -1;
   lastVideoTime = -1;
   lastVideoFrames = 0;
+  castAnsweredAt = 0;
   castVideo.hidden = true;
 }
 
@@ -667,11 +675,13 @@ function stopViewing(notify = true) {
 
 async function receiveFrame(generation) {
   if (generation !== castGeneration || !useFrames) return;
+  let delay = 70;
   try {
     const response = await request('/api/cast/frame', 'GET', {
-      'X-Cast-Viewer': castViewer, 'X-Cast-After': frameSequence,
+      'X-Cast-Viewer': castViewer, 'X-Cast-After': frameSequence, 'X-Cast-Wait': '1',
     });
     if (response.status === 200) {
+      delay = 0;
       const url = URL.createObjectURL(await response.blob());
       try {
         const image = new Image();
@@ -685,10 +695,16 @@ async function receiveFrame(generation) {
         castCanvas.getContext('2d').drawImage(image, 0, 0);
         frameSequence = response.headers.get('X-Cast-Sequence') || '0';
         lastFrameAt = Date.now();
+        framesInWindow++;
+        if (lastFrameAt - frameWindowAt >= 1000) {
+          const fps = Math.round(framesInWindow * 1000 / (lastFrameAt - frameWindowAt));
+          castStatus(`兼容播放 · ${castCanvas.width} × ${castCanvas.height} · ${fps} fps · 无音频`);
+          framesInWindow = 0;
+          frameWindowAt = lastFrameAt;
+        }
         castCanvas.hidden = false;
         byId('cast-fullscreen').hidden = !document.fullscreenEnabled;
         byId('cast-placeholder').hidden = true;
-        castStatus(`兼容播放 · ${castCanvas.width} × ${castCanvas.height} · 无音频`);
       } finally {
         URL.revokeObjectURL(url);
       }
@@ -701,7 +717,7 @@ async function receiveFrame(generation) {
         clearCastPicture();
         castStatus('正在等待电脑送出画面…');
       }
-      frameTimer = setTimeout(() => receiveFrame(generation), 90);
+      frameTimer = setTimeout(() => receiveFrame(generation), delay);
     }
   }
 }
@@ -722,7 +738,10 @@ function checkCastPlayback() {
     byId('cast-placeholder').hidden = true;
     castStatus(`正在播放 · ${castVideo.videoWidth} × ${castVideo.videoHeight}${fps ? ` · ${fps} fps` : ''}`);
   } else if (!castVideo.paused || lastVideoTime < 0) {
-    if (Date.now() - (lastFrameAt || castStarted) > 8500) {
+    const now = Date.now();
+    const stalled = lastFrameAt ? now - lastFrameAt > 12000 :
+      castAnsweredAt ? now - castAnsweredAt > 12000 : now - castStarted > 20000;
+    if (stalled) {
       useFrames = true;
       byId('cast-mode').textContent = '重新尝试直连';
       clearCastPeer();
@@ -754,6 +773,8 @@ async function refreshCast() {
       if (!frameTimer) {
         frameSequence = '0';
         lastFrameAt = Date.now();
+        frameWindowAt = lastFrameAt;
+        framesInWindow = 0;
         frameTimer = setTimeout(() => receiveFrame(current), 0);
       }
       return;
@@ -765,7 +786,7 @@ async function refreshCast() {
         stopViewing(false);
         showCastAvailability(false);
       } else {
-        castStatus('正在连接电脑…');
+        castStatus('正在等待电脑发送直连候选，可以手动切换兼容播放。');
       }
       return;
     }
@@ -802,11 +823,10 @@ async function refreshCast() {
     }, answer);
     if (!result.ok) {
       const error = await result.json();
-      if (peer === castPeer && error.code === 'no_lan_candidate') {
-        castStarted = Date.now() - 8501;
-      }
+      if (peer === castPeer && error.code === 'no_lan_candidate') castStarted = Date.now() - 15000;
       throw new Error('answer');
     }
+    if (peer === castPeer) castAnsweredAt = Date.now();
   } catch {
     if (current === castGeneration) {
       clearCastPeer();
@@ -1378,7 +1398,7 @@ async function start() {
     if (!document.hidden || watching || queue.some((item) => !item.cancelled && !item.finished)) poll();
   }, pollInterval);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
-  setInterval(refreshCast, 900);
+  setInterval(refreshCast, 500);
 }
 start();
   updateQueueSummary();

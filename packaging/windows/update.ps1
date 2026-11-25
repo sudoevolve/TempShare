@@ -116,24 +116,40 @@ try {
         elseif (Test-Path -LiteralPath $autoPath) { Remove-Item -LiteralPath $autoPath }
     }
     $token = ''
-    if (Test-Path -LiteralPath $secretPath) {
-        $secure = Get-Content -LiteralPath $secretPath | ConvertTo-SecureString
-        try { $token = [Net.NetworkCredential]::new('', $secure).Password }
-        finally { $secure.Dispose() }
-    }
     [IO.File]::WriteAllText($lastPath, '')
-    try { $release = Get-Release $token }
+    try { $release = Get-Release '' }
     catch {
         $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-        if ($Automatic -or $code -notin @(401, 403, 404)) { throw }
-        $token = Configure-Token
-        if (!$token) {
-            if ((Message '打开 GitHub 发布页？请在浏览器登录有仓库权限的账号。' 'YesNo') -eq 'Yes') {
-                Start-Process "https://github.com/$repo/releases"
+        if ($code -notin @(401, 403, 404)) { throw }
+        if ($code -eq 404) {
+            $publicRepo = $null
+            try {
+                $publicRepo = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo" -UserAgent 'TempShare' -TimeoutSec 10
+            } catch { }
+            if ($publicRepo -and $publicRepo.private -eq $false) {
+                if (!$Automatic) { [void](Message 'GitHub 暂无可下载的正式版本。') }
+                exit
             }
-            exit
         }
-        $release = Get-Release $token
+        if (Test-Path -LiteralPath $secretPath) {
+            try {
+                $secure = Get-Content -LiteralPath $secretPath | ConvertTo-SecureString
+                try { $token = [Net.NetworkCredential]::new('', $secure).Password }
+                finally { $secure.Dispose() }
+                $release = Get-Release $token
+            } catch { $release = $null }
+        }
+        if (!$release) {
+            if ($Automatic) { exit }
+            $token = Configure-Token
+            if (!$token) {
+                if ((Message '打开 GitHub 发布页？请在浏览器登录有仓库权限的账号。' 'YesNo') -eq 'Yes') {
+                    Start-Process "https://github.com/$repo/releases"
+                }
+                exit
+            }
+            $release = Get-Release $token
+        }
     }
     if ($release.draft -or $release.prerelease -or $release.tag_name -notmatch '^v([0-9]+\.[0-9]+\.[0-9]+)$') { throw 'No stable release' }
     $version = [version]$Matches[1]
