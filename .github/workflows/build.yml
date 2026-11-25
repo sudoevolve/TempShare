@@ -1,0 +1,41 @@
+name: Build and test
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            tls: 'OFF'
+          - os: ubuntu-latest
+            tls: 'ON'
+          - os: macos-latest
+            tls: 'OFF'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libssl-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTEMPSHARE_TLS=${{ matrix.tls }}
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Check browser scripts
+        run: node --check src/web/app.js && node --check src/web/cast-host.js && node --check src/web/rtc.js && node --check src/web/resume.js
+      - name: Prepare binary and attribution files
+        run: cmake --install build --config Release --prefix dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tempshare-${{ matrix.os }}
+          path: dist/

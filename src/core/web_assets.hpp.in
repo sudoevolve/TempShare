@@ -7,4 +7,5 @@ inline constexpr char script[] = R"tempshare(@app.js@)tempshare";
 inline constexpr char cast_page[] = R"tempshare(@cast.html@)tempshare";
 inline constexpr char cast_host[] = R"tempshare(@cast-host.js@)tempshare";
 inline constexpr char rtc[] = R"tempshare(@rtc.js@)tempshare";
+inline constexpr char resume[] = R"tempshare(@resume.js@)tempshare";
 }

@@ -10,6 +10,7 @@ let stream;
 let peer;
 let ended = false;
 let busy = false;
+let capturing = false;
 let failures = 0;
 let nextOffer = 0;
 let negotiatingSince = 0;
@@ -62,6 +63,7 @@ async function applySettings() {
 }
 
 async function capture() {
+  capturing = true;
   start.disabled = true;
   try {
     const media = await navigator.mediaDevices.getDisplayMedia({
@@ -83,6 +85,8 @@ async function capture() {
       start.disabled = false;
       status('未能获取画面。请检查浏览器的屏幕录制权限。');
     }
+  } finally {
+    capturing = false;
   }
 }
 
@@ -126,7 +130,14 @@ async function tick() {
     if (!response.ok) throw new Error('cast host');
     failures = 0;
     const signal = await response.json();
-    if (!stream) return;
+    if (!stream) {
+      start.disabled = capturing;
+      return;
+    }
+    if (!signal.ready) {
+      const ready = await host('ready');
+      if (!ready.ok) throw new Error('cast readiness');
+    }
     if (!signal.viewing) {
       closePeer();
       status('等待配对设备开始观看。');

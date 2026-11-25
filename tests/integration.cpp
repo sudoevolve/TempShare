@@ -7,6 +7,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <atomic>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
@@ -129,6 +131,13 @@ void roundtrip(const fs::path& path) {
     for (const auto& file : fs::directory_iterator(received.front().path.parent_path())) {
         require(file.path().extension() != ".part", "clean temporary upload artifacts");
     }
+    std::ofstream(outbound, std::ios::binary | std::ios::trunc) << "changed content";
+    expect(browser.Get(download_path, auth), 409, "changed shared file is rejected");
+    const auto previous = path / "previous.txt";
+    fs::rename(outbound, previous);
+    std::ofstream(outbound, std::ios::binary) << "shared content";
+    fs::last_write_time(outbound, fs::last_write_time(previous));
+    expect(browser.Get(download_path, auth), 409, "same-size replacement must fail identity verification");
 
     session.unshare(shared.id);
     expect(browser.Get(download_path, auth), 404, "removing file revokes download");
@@ -305,6 +314,160 @@ void trusted_devices(const fs::path& path) {
             !session.reconnect(remembered), "revocation ends current trust and prevents future connections");
 }
 
+void interaction_contracts(const fs::path& path) {
+    tempshare::Session session(path);
+    tempshare::HttpServer server(session);
+    require(server.start(0, true), "start interaction server");
+    httplib::Client browser("127.0.0.1", server.port());
+    browser.set_read_timeout(3);
+    session.start();
+    const auto invite = session.snapshot().invitation;
+    const auto pending = session.pair(invite, "Phone");
+    require(pending && session.disconnect(pending->token), "browser cancels pending pairing");
+    require(!session.pair(invite), "cancelled invitation was rotated");
+    const auto pair = session.pair(session.snapshot().invitation, "Phone");
+    require(pair && session.decide_pairing(pair->token, true), "approve current browser");
+    const httplib::Headers auth{{"Cookie", "ts_" + std::to_string(server.port()) + "=" + pair->token}};
+    const auto first = session.offer(pair->token, "first.txt", 1);
+    const auto second = session.offer(pair->token, "second.txt", 1);
+    const auto unseen = session.offer(pair->token, "unseen.txt", 1);
+    require(first && second && unseen, "create browser file requests");
+    require(session.decide_offers({first->id, second->id, first->id}, true) == 2, "approve each selected file once");
+    require(session.snapshot().offers.back().state == tempshare::State::pending, "unseen request still needs approval");
+    const auto status = browser.Get("/api/pair", auth);
+    expect(status, 200, "poll paired browser");
+    require(status->body.find("\"castReady\":false") != std::string::npos, "viewer waits for source selection");
+    const auto key = session.open_cast();
+    require(!key.empty(), "open local cast console");
+    expect(browser.Post("/api/cast/ready", {{"X-TempShare", "1"}}, "", "text/plain"), 403,
+           "only the local cast console can claim readiness");
+    const httplib::Headers host{{"X-TempShare", "1"}, {"X-Cast-Key", key}};
+    expect(browser.Post("/api/cast/ready", host, "", "text/plain"), 204, "authorize selected source");
+    require(session.snapshot().capture_ready, "desktop reflects capture readiness");
+    const auto ready = browser.Get("/api/pair", auth);
+    expect(ready, 200, "poll capture readiness");
+    require(ready->body.find("\"castReady\":true") != std::string::npos, "viewer can now start watching");
+    const auto viewer = tempshare::random_token();
+    const auto other = tempshare::random_token();
+    require(session.cast_viewer(pair->token, true, viewer).has_value(), "claim viewer lease");
+    require(!session.cast_viewer(pair->token, false, other), "other tab cannot stop the current viewer");
+    require(!session.cast_viewer(pair->token, true, other), "other tab cannot steal the current viewer");
+    require(session.cast_viewer(pair->token, false, viewer).has_value(), "owner releases viewer lease");
+    require(session.cast_viewer(pair->token, true, other).has_value(), "a different tab can now watch");
+    require(server.update_networks({{"192.168.20.10", 0xc0a8140a, 0xffffff00}}), "set casting subnet");
+    const std::string elsewhere = "v=0\r\na=candidate:1 1 UDP 2122260223 192.168.21.10 50000 typ host\r\n";
+    expect(browser.Post("/api/cast/offer", host, elsewhere, "text/plain"), 409,
+           "cast ignores numeric candidates beyond the local subnet");
+    const std::string same_subnet = "v=0\r\na=candidate:1 1 UDP 2122260223 192.168.20.20 50000 typ host\r\n";
+    expect(browser.Post("/api/cast/offer", host, same_subnet, "text/plain"), 201,
+           "cast accepts a candidate within the local subnet");
+    expect(browser.Post("/api/cast/stop", host, "", "text/plain"), 204, "stop sharing");
+    require(!session.snapshot().capture_ready, "stop clears capture readiness");
+}
+
+void receive_limits(const fs::path& path) {
+    tempshare::Session* observed = nullptr;
+    unsigned notifications = 0;
+    tempshare::Session session(path, [&] {
+        if (observed) observed->snapshot(tempshare::SnapshotPage::nearby);
+        ++notifications;
+    });
+    observed = &session;
+    session.start();
+    require(notifications == 1, "state notification can safely obtain a snapshot");
+    auto pair = session.pair(session.snapshot().invitation);
+    require(pair && session.decide_pairing(pair->token, true), "approve sender");
+    std::vector<std::string> ids;
+    for (int i = 0; i < 5; ++i) {
+        const auto item = session.offer(pair->token, "archive.zip", tempshare::max_file_size);
+        require(item.has_value(), "create large request without allocating its bytes");
+        ids.push_back(item->id);
+    }
+    require(session.decide_offers(ids, true) == 4, "batch approval observes the session byte quota");
+    require(session.cancel_offer(pair->token, ids.front()), "cancel releases reserved capacity");
+    require(session.decide_offer(ids.back(), true), "released quota can be reused");
+    const auto old_dir = path / "TempShare-abcdef012345";
+    const auto workspace = old_dir / ".tempshare-partials";
+    fs::create_directories(workspace);
+    const auto stale = workspace / (".upload-" + std::string(32, 'a') + ".part");
+    const auto fresh = workspace / (".upload-" + std::string(32, 'b') + ".part");
+    const auto ordinary = old_dir / stale.filename();
+    for (const auto& file : {stale, fresh, ordinary}) std::ofstream(file) << "test";
+    const auto old = fs::file_time_type::clock::now() - 72h;
+    fs::last_write_time(stale, old);
+    fs::last_write_time(ordinary, old);
+    tempshare::clean_interrupted_uploads(fs::canonical(path));
+    require(!fs::exists(stale) && fs::exists(fresh) && fs::exists(ordinary),
+            "reclaim only old application upload fragments");
+
+    const auto blocked_path = path / "blocked-receive";
+    std::ofstream(blocked_path) << "not a directory";
+    tempshare::Session blocked(blocked_path);
+    blocked.start();
+    const auto client = blocked.pair(blocked.snapshot().invitation);
+    require(client && blocked.decide_pairing(client->token, true), "authorize browser for disk failure");
+    const auto blocked_offer = blocked.offer(client->token, "data.txt", 1);
+    require(blocked_offer && blocked.decide_offer(blocked_offer->id, true), "approve upload before disk failure");
+    tempshare::UploadFailure failure{};
+    require(!blocked.begin_upload(client->token, blocked_offer->id, 1, {}, &failure) &&
+            failure == tempshare::UploadFailure::storage && read(blocked_path) == "not a directory",
+            "report a bad receive directory and preserve existing data");
+}
+
+void transfer_capacity(const fs::path& path) {
+    tempshare::Session session(path);
+    session.start();
+    const auto pair = session.pair(session.snapshot().invitation);
+    require(pair && session.decide_pairing(pair->token, true), "approve sender for capacity test");
+    std::vector<std::string> ids;
+    for (int i = 0; i < 5; ++i) {
+        const auto offer = session.offer(pair->token, "concurrent.bin", 1);
+        require(offer && session.decide_offer(offer->id, true), "approve concurrent transfer");
+        ids.push_back(offer->id);
+    }
+    tempshare::HttpServer server(session);
+    require(server.start(0, true), "start capacity server");
+    const httplib::Headers auth{{"Cookie", "ts_" + std::to_string(server.port()) + "=" + pair->token},
+                               {"X-TempShare", "1"}};
+    std::atomic<bool> release{false};
+    std::vector<std::future<httplib::Result>> clients;
+    struct Release {
+        std::atomic<bool>& flag;
+        ~Release() { flag = true; }
+    } release_on_failure{release};
+    for (std::size_t i = 0; i < 4; ++i) {
+        clients.push_back(std::async(std::launch::async, [&, i] {
+            httplib::Client client("127.0.0.1", server.port());
+            client.set_read_timeout(4);
+            return client.Put("/api/upload/" + ids[i], auth, 1,
+                [&](std::size_t, std::size_t, httplib::DataSink& sink) {
+                    while (!release) std::this_thread::sleep_for(5ms);
+                    return sink.write("x", 1);
+                }, "application/octet-stream");
+        }));
+    }
+    const auto deadline = tempshare::Session::Clock::now() + 4s;
+    unsigned uploading = 0;
+    do {
+        const auto offers = session.snapshot().offers;
+        uploading = static_cast<unsigned>(std::count_if(offers.begin(), offers.end(),
+            [](const tempshare::Offer& offer) { return offer.state == tempshare::State::uploading; }));
+        if (uploading == 4) break;
+        std::this_thread::sleep_for(10ms);
+    } while (tempshare::Session::Clock::now() < deadline);
+    require(uploading == 4, "four streaming requests keep their slots until completion");
+    httplib::Client control("127.0.0.1", server.port());
+    control.set_read_timeout(2);
+    expect(control.Get("/api/pair", auth), 200, "control request proceeds during four uploads");
+    const auto full = control.Put("/api/upload/" + ids.back(), auth, "y", "application/octet-stream");
+    expect(full, 503, "fifth transfer receives a retryable error");
+    require(full->body.find("transfer_busy") != std::string::npos, "client can identify transfer capacity error");
+    release = true;
+    for (auto& client : clients) expect(client.get(), 201, "admitted transfer finishes");
+    expect(control.Put("/api/upload/" + ids.back(), auth, "y", "application/octet-stream"), 201,
+           "slot released after completed request");
+}
+
 }  // namespace
 
 int main() {
@@ -315,9 +478,26 @@ int main() {
         network_changes(scratch.path);
         lan_features(scratch.path);
         trusted_devices(scratch.path);
+        interaction_contracts(scratch.path);
+        receive_limits(scratch.path);
+        transfer_capacity(scratch.path);
         const tempshare::LocalNetwork lan{"192.168.70.31", 0xc0a8461f, 0xffffff00};
         require(lan.contains("192.168.70.22") && !lan.contains("192.168.71.22") &&
                 !lan.contains("8.8.8.8"), "accept only the IPv4 LAN subnet");
+        const tempshare::LocalNetwork wired{"192.168.74.3", 0xc0a84a03, 0xffffff00};
+        require(tempshare::permits_private_lan_peer({wired}, "192.168.74.3", "192.168.70.22"),
+                "allow routed clients on another private IPv4 subnet");
+        require(!tempshare::permits_private_lan_peer({wired}, "192.168.12.1", "192.168.70.22") &&
+                !tempshare::permits_private_lan_peer({wired}, "192.168.74.3", "8.8.8.8"),
+                "reject unowned interfaces and public network clients");
+        require(tempshare::is_private_ipv4("192.168.70.22") &&
+                tempshare::is_private_ipv4("10.12.0.8") &&
+                tempshare::is_private_ipv4("172.20.1.4") &&
+                !tempshare::is_private_ipv4("169.254.10.2") &&
+                !tempshare::is_private_ipv4("8.8.8.8"),
+                "accept RFC1918 addresses and reject link-local and public addresses");
+        require(!tempshare::permits_private_lan_peer({wired}, "192.168.74.3", "169.254.10.2"),
+                "reject link-local clients without routed LAN connectivity");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

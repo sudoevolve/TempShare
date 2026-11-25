@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101527">
+  <meta name="theme-color" content="#15191b">
   <title>TempShare</title>
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" type="module"></script>
@@ -19,33 +19,38 @@
     </header>
 
     <section id="connect-panel" class="hero" aria-labelledby="connect-title">
-      <div class="radar" aria-hidden="true">
-        <div class="radar-middle"><div class="radar-inner"><span class="computer"></span></div></div>
-      </div>
       <h1 id="connect-title">连接到电脑</h1>
       <p id="connect-description">输入电脑上显示的连接码。</p>
       <form id="pair-form">
-        <label for="device-name">设备名称</label>
-        <input id="device-name" class="device-name" name="device" autocomplete="off" maxlength="30" placeholder="我的设备">
         <label for="pair-code">连接码</label>
         <input id="pair-code" name="code" inputmode="numeric" autocomplete="off" minlength="6" maxlength="6"
                pattern="[0-9]{6}" placeholder="000000" required>
-        <button class="primary" type="submit">请求连接</button>
+        <button class="primary" type="submit">连接</button>
+        <details class="device-details">
+          <summary>更改设备名称</summary>
+          <label for="device-name">设备名称</label>
+          <input id="device-name" class="device-name" name="device" autocomplete="off" maxlength="30" placeholder="我的设备">
+        </details>
         <button id="trusted-connect" type="button" hidden>用已记住的设备连接</button>
       </form>
+      <button id="retry-connection" type="button" hidden>重新连接</button>
       <output id="verification" class="verification" aria-live="polite" hidden></output>
     </section>
 
     <nav id="feature-nav" class="feature-nav" aria-label="功能" hidden>
       <button type="button" data-panel="share" aria-pressed="true">文件分享</button>
       <button type="button" data-panel="sync" aria-pressed="false">内容同步</button>
-      <button type="button" data-panel="cast" aria-pressed="false">屏幕投递</button>
+      <button type="button" data-panel="cast" aria-pressed="false">屏幕投递<span id="cast-ready" hidden> · 可观看</span></button>
     </nav>
+    <p id="message" class="message" role="status" hidden></p>
     <section id="share-panel" hidden>
-      <div class="share-heading">
-        <h1>文件分享</h1>
-        <p>在同一局域网内与电脑传输文件。</p>
-      </div>
+      <section class="transfer-section" aria-labelledby="download-title">
+        <h1 id="download-title">从电脑接收</h1>
+        <ul id="download-list" class="file-list"></ul>
+        <p id="no-files" class="empty">暂无共享文件</p>
+      </section>
+      <section class="transfer-section" aria-labelledby="send-title">
+      <h2 id="send-title">发送到电脑</h2>
       <p id="upload-disabled" class="empty" hidden>电脑关闭了文件接收权限。</p>
       <label id="dropzone" class="dropzone" for="file-input">
         <input id="file-input" type="file" multiple>
@@ -53,15 +58,15 @@
         <strong>选择要发送的文件</strong>
         <span>可选择多个文件，每个文件最高 1 GiB</span>
       </label>
+      <label id="resume-option" class="resume-option" hidden>
+        <input id="remember-uploads" type="checkbox"> 允许本页刷新后重新选择文件续传
+      </label>
+      <ul id="resume-list" class="file-list" aria-label="可恢复的文件"></ul>
+      </section>
 
       <section id="uploads" class="transfer-section" aria-labelledby="upload-title" hidden>
         <h2 id="upload-title">发送队列</h2>
-        <ul id="upload-list" class="file-list"></ul>
-      </section>
-      <section class="transfer-section" aria-labelledby="download-title">
-        <h2 id="download-title">电脑分享的文件</h2>
-        <ul id="download-list" class="file-list"></ul>
-        <p id="no-files" class="empty">电脑分享文件后会显示在这里。</p>
+        <ul id="upload-list" class="file-list" aria-label="发送队列"></ul>
       </section>
     </section>
     <section id="sync-panel" hidden>
@@ -80,10 +85,9 @@
     <section id="cast-panel" hidden>
       <div class="share-heading"><h1>屏幕投递</h1></div>
       <video id="cast-video" class="cast-video" autoplay playsinline muted controls hidden></video>
-      <button id="cast-watch" class="primary" type="button">开始观看</button>
-      <p id="cast-status" class="message" role="status"></p>
+      <p id="cast-status" class="message" role="status">等待电脑选择共享来源。</p>
+      <button id="cast-watch" class="primary" type="button" disabled>开始观看</button>
     </section>
-    <p id="message" class="message" role="status"></p>
   </main>
 </body>
 </html>

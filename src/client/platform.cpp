@@ -20,21 +20,27 @@
 extern char** environ;
 #endif
 
-std::vector<std::filesystem::path> choose_paths(bool directory) {
+std::vector<std::filesystem::path> choose_paths(bool directory, bool* failed) {
+    if (failed) *failed = false;
     std::vector<std::filesystem::path> paths;
 #ifdef _WIN32
     using Microsoft::WRL::ComPtr;
     const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    if (FAILED(initialized)) return paths;
+    if (FAILED(initialized)) {
+        if (failed) *failed = true;
+        return paths;
+    }
     {
         ComPtr<IFileOpenDialog> dialog;
-        if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
-                                       IID_PPV_ARGS(dialog.GetAddressOf())))) {
+        const auto setup = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                             IID_PPV_ARGS(dialog.GetAddressOf()));
+        if (SUCCEEDED(setup)) {
             FILEOPENDIALOGOPTIONS options{};
-            if (SUCCEEDED(dialog->GetOptions(&options)) &&
-                SUCCEEDED(dialog->SetOptions(options | FOS_FORCEFILESYSTEM |
-                                             (directory ? FOS_PICKFOLDERS : FOS_ALLOWMULTISELECT))) &&
-                SUCCEEDED(dialog->Show(GetActiveWindow()))) {
+            auto result = dialog->GetOptions(&options);
+            if (SUCCEEDED(result)) result = dialog->SetOptions(options | FOS_FORCEFILESYSTEM |
+                (directory ? FOS_PICKFOLDERS : FOS_ALLOWMULTISELECT));
+            if (SUCCEEDED(result)) result = dialog->Show(GetActiveWindow());
+            if (SUCCEEDED(result)) {
                 ComPtr<IShellItemArray> items;
                 DWORD count = 0;
                 if (SUCCEEDED(dialog->GetResults(items.GetAddressOf()))) items->GetCount(&count);
@@ -48,6 +54,9 @@ std::vector<std::filesystem::path> choose_paths(bool directory) {
                     }
                 }
             }
+            if (failed && result != HRESULT_FROM_WIN32(ERROR_CANCELLED)) *failed = paths.empty();
+        } else if (failed) {
+            *failed = true;
         }
     }
     CoUninitialize();
@@ -69,7 +78,12 @@ std::vector<std::filesystem::path> choose_paths(bool directory) {
         char buffer[4096];
         std::string result;
         while (fgets(buffer, sizeof(buffer), pipe)) result += buffer;
-        if (pclose(pipe) != 0 || result.empty()) return paths;
+        const int status = pclose(pipe);
+        if (status == -1 || !WIFEXITED(status) || WEXITSTATUS(status) > 1) {
+            if (failed) *failed = true;
+            return paths;
+        }
+        if (status || result.empty()) return paths;
         if (result.back() == '\n') result.pop_back();
         const char separator = directory ? '\0' : '|';
         std::size_t start = 0;
@@ -79,6 +93,8 @@ std::vector<std::filesystem::path> choose_paths(bool directory) {
             if (end == std::string::npos) break;
             start = end + 1;
         }
+    } else if (failed) {
+        *failed = true;
     }
 #endif
     return paths;
@@ -103,6 +119,20 @@ bool open_url(const std::string& url) {
         while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {}
     }).detach();
     return true;
+#endif
+}
+
+bool open_folder(const std::filesystem::path& directory) {
+#ifdef _WIN32
+    return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", directory.c_str(),
+                                                    nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+#elif defined(__APPLE__)
+    @autoreleasepool {
+        NSString* path = [NSString stringWithUTF8String:directory.c_str()];
+        return [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:path]];
+    }
+#else
+    return open_url(directory.string());
 #endif
 }
 

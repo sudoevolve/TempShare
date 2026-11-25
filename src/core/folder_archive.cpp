@@ -4,6 +4,7 @@
 #define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #include <miniz.h>
 
+#include <algorithm>
 #include <fstream>
 #include <stdexcept>
 
@@ -33,17 +34,18 @@ struct Archive {
 };
 
 struct Entry {
-    std::ifstream input;
+    SharedSource& input;
+    SourceVersion version;
     const std::function<bool()>& cancelled;
     std::uint64_t copied = 0;
 };
 
 size_t read_entry(void* opaque, mz_uint64 offset, void* buffer, size_t bytes) {
     auto& entry = *static_cast<Entry*>(opaque);
-    if (entry.cancelled()) return 0;
-    entry.input.seekg(static_cast<std::streamoff>(offset));
-    entry.input.read(static_cast<char*>(buffer), static_cast<std::streamsize>(bytes));
-    const auto copied = static_cast<size_t>(entry.input.gcount());
+    if (entry.cancelled() || offset > entry.version.size) return 0;
+    const auto copied = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, entry.version.size - offset));
+    if (!entry.input.read(offset, static_cast<char*>(buffer), copied) ||
+        !(entry.input.version() == entry.version)) return 0;
     entry.copied = offset + copied;
     return copied;
 }
@@ -52,11 +54,15 @@ std::shared_ptr<const std::filesystem::path> temporary_directory() {
     const auto path = std::filesystem::temp_directory_path() / ("TempShare-zip-" + random_token());
     auto directory = std::unique_ptr<std::filesystem::path>(new std::filesystem::path(path));
     if (!std::filesystem::create_directory(path)) throw std::runtime_error("无法创建 ZIP 临时目录");
-    return {directory.release(), [](const std::filesystem::path* value) {
+    const auto owned = std::shared_ptr<const std::filesystem::path>(directory.release(), [](const std::filesystem::path* value) {
         std::error_code error;
         std::filesystem::remove_all(*value, error);
         delete value;
-    }};
+    });
+#ifndef _WIN32
+    std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+#endif
+    return owned;
 }
 
 }  // namespace
@@ -79,7 +85,8 @@ FolderArchive archive_folder(const std::filesystem::path& folder, const std::fun
         if (cancelled()) throw std::runtime_error("打包已取消");
         const auto relative = it->path().lexically_relative(root);
         const auto state = it->symlink_status();
-        if (fs::is_symlink(state) || fs::canonical(it->path()).lexically_relative(root) != relative) {
+        if (it->path() == *directory || fs::is_symlink(state) ||
+            fs::canonical(it->path()).lexically_relative(root) != relative) {
             it.disable_recursion_pending();
             continue;
         }
@@ -94,11 +101,14 @@ FolderArchive archive_folder(const std::filesystem::path& folder, const std::fun
                 throw std::runtime_error("无法写入 ZIP 目录");
             }
         } else if (fs::is_regular_file(state)) {
-            const auto size = it->file_size();
+            SharedSource source(it->path());
+            const auto version = source.version();
+            if (!version) throw std::runtime_error("归档期间文件不可用");
+            const auto size = version->size;
             if (size > max_file_size - total) throw std::runtime_error("文件夹超过 1 GiB");
             total += size;
-            Entry entry{std::ifstream(it->path(), std::ios::binary), cancelled};
-            if (!entry.input || !mz_zip_writer_add_read_buf_callback(
+            Entry entry{source, *version, cancelled};
+            if (!mz_zip_writer_add_read_buf_callback(
                 &archive.zip, entry_name.c_str(), read_entry, &entry, size,
                 nullptr, nullptr, 0, MZ_BEST_SPEED, nullptr, 0, nullptr, 0) || entry.copied != size) {
                 throw std::runtime_error("无法打包文件夹");

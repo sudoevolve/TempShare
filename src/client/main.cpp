@@ -6,6 +6,9 @@
 
 #define AINO_IMPLEMENTATION
 #include "aino.hpp"
+#ifdef _WIN32
+#include <shellapi.h>
+#endif
 
 #include <qrcodegen.hpp>
 
@@ -31,14 +34,14 @@ using aino::Style;
 using aino::Ui;
 using tempshare::State;
 
-const Color background{13, 17, 33};
-const Color sidebar{20, 25, 44};
-const Color surface{25, 32, 56};
-const Color border{47, 58, 88};
-const Color text{242, 245, 255};
-const Color muted{169, 181, 212};
-const Color accent{101, 112, 255};
-const Color online{109, 228, 178};
+const Color background{246, 247, 249};
+const Color sidebar{237, 239, 242};
+const Color surface{255, 255, 255};
+const Color border{220, 223, 228};
+const Color text{30, 32, 36};
+const Color muted{103, 108, 117};
+const Color accent{0, 122, 255};
+const Color online{45, 145, 100};
 
 struct Options {
     unsigned short port = 8787;
@@ -95,8 +98,8 @@ std::string readable_size(std::uint64_t size) {
 }
 
 void card(Ui& ui, Rect box) {
-    ui.fill_rect(box, surface, 14);
-    ui.stroke_rect(box, border, 14);
+    ui.fill_rect(box, surface, 8);
+    ui.stroke_rect(box, border, 8);
 }
 
 void draw_qr(Ui& ui, const qrcodegen::QrCode& qr, Rect area) {
@@ -115,12 +118,10 @@ void draw_qr(Ui& ui, const qrcodegen::QrCode& qr, Rect area) {
 }
 
 struct View {
-    enum class Page { share, sync, cast, nearby, received, devices, settings };
+    using Page = tempshare::SnapshotPage;
     Page page = Page::share;
     std::string selected_address;
-    std::size_t file_page = 0;
     std::size_t peer_page = 0;
-    std::size_t received_page = 0;
     std::size_t offer_page = 0;
     std::string status;
     std::string path;
@@ -134,6 +135,13 @@ struct View {
     std::string last_qr_url;
     std::optional<qrcodegen::QrCode> qr;
 };
+
+std::vector<std::filesystem::path> pick_paths(View& view, bool directory) {
+    bool failed = false;
+    auto paths = choose_paths(directory, &failed);
+    if (failed) view.status = "无法打开文件选择器，可在设置中输入路径";
+    return paths;
+}
 
 std::size_t page_controls(Ui& ui, std::size_t& page, std::size_t total, std::size_t per_page,
                           float x, float y, float width) {
@@ -161,7 +169,7 @@ void share_paths(tempshare::Session& session, View& view, const std::vector<std:
 void share_folder(tempshare::Session& session, aino::Window& window, View& view,
                   const tempshare::Snapshot& snapshot) {
     if (view.archive.valid()) return;
-    const auto paths = choose_paths(true);
+    const auto paths = pick_paths(view, true);
     if (paths.empty()) return;
     std::packaged_task<std::string()> archive([&session, folder = paths.front(), invitation = snapshot.invitation] {
         try {
@@ -180,13 +188,10 @@ void share_folder(tempshare::Session& session, aino::Window& window, View& view,
     view.status = "正在打包文件夹…";
 }
 
-void render_share(Ui& ui, aino::Window& window, tempshare::Session& session, const tempshare::HttpServer& server,
-                  const tempshare::Snapshot& snapshot, const std::vector<tempshare::LocalNetwork>& networks,
-                  View& view, float x, float width) {
-    constexpr float connect_width = 256;
-    const float transfer_width = width - connect_width - 18;
-    const float qr_left = x + transfer_width + 18;
-    card(ui, {qr_left, 106, connect_width, 430});
+void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session, const tempshare::HttpServer& server,
+                       const tempshare::Snapshot& snapshot, const std::vector<tempshare::LocalNetwork>& networks,
+                       View& view, float qr_left) {
+    card(ui, {qr_left, 106, 256, 430});
     label(ui, "连接设备", {qr_left + 18, 121, 220, 30}, 16, text, true);
     if (snapshot.active) {
         const auto selected = std::find_if(networks.begin(), networks.end(), [&](const tempshare::LocalNetwork& network) {
@@ -200,18 +205,47 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session, con
             view.qr = qrcodegen::QrCode::encodeText(invitation.c_str(), qrcodegen::QrCode::Ecc::MEDIUM);
             view.last_qr_url = invitation;
         }
-        if (snapshot.pairing && snapshot.pairing->state == State::approved) {
-            label(ui, "浏览器已连接", {qr_left + 18, 177, 220, 32}, 17, online, true);
-            label(ui, "结束会话后可连接另一台设备", {qr_left + 18, 219, 220, 24}, 12, muted);
+        if (snapshot.pairing) {
+            const auto& pairing = *snapshot.pairing;
+            label(ui, pairing.name, {qr_left + 18, 162, 220, 32}, 17, text, true);
+            if (pairing.state == State::pending) {
+                label(ui, "请求连接 · 核对浏览器上的验证码", {qr_left + 18, 201, 220, 24}, 12, muted);
+                label(ui, pairing.verification, {qr_left + 18, 233, 220, 42}, 27, online, true);
+                if (button(ui, "允许连接", {qr_left + 18, 287, 104, 34}, true)) {
+                    session.decide_pairing(pairing.token, true);
+                }
+                if (button(ui, "拒绝", {qr_left + 134, 287, 104, 34})) session.decide_pairing(pairing.token, false);
+            } else {
+                label(ui, "已连接", {qr_left + 18, 200, 220, 26}, 13, online, true);
+                const auto waiting = std::count_if(snapshot.offers.begin(), snapshot.offers.end(),
+                    [](const tempshare::Offer& offer) { return offer.state == State::pending; });
+                if (waiting && button(ui, std::to_string(waiting) + " 个文件待接收",
+                                      {qr_left + 18, 249, 220, 36}, true)) {
+                    view.page = View::Page::share;
+                    view.offer_page = 0;
+                    window.wake();
+                }
+                if (snapshot.capture_ready) {
+                    label(ui, "正在共享屏幕", {qr_left + 18, 311, 220, 27}, 13, online);
+                    if (button(ui, "停止共享", {qr_left + 18, 342, 220, 33})) session.stop_cast();
+                }
+            }
         } else {
             if (networks.empty()) {
-                label(ui, "等待局域网连接", {qr_left + 18, 165, 220, 32}, 16, text, true);
-                label(ui, "连接网络后会自动更新二维码", {qr_left + 18, 201, 220, 25}, 12, muted);
+                label(ui, "没有可用的局域网地址", {qr_left + 18, 165, 220, 32}, 15, text, true);
+                label(ui, "请连接与手机相同的网络", {qr_left + 18, 201, 220, 25}, 12, muted);
             } else {
                 draw_qr(ui, *view.qr, {qr_left + 25, 151, 206, 206});
             }
-            label(ui, url, {qr_left + 18, 361, 220, 24}, 12, muted);
-            label(ui, "手动连接码  " + snapshot.code, {qr_left + 18, 387, 220, 30}, 16, text, true);
+            if (!networks.empty()) {
+                label(ui, url, {qr_left + 18, 361, 220, 24}, 12, muted);
+                const auto& network = *current;
+                const auto kind = network.interface_name.empty() ? std::string{} :
+                    network.interface_name + (network.wireless ? " · Wi-Fi" : " · 以太网");
+                label(ui, kind.empty() ? "手机需可访问此地址" : kind + " · 手机需可访问",
+                      {qr_left + 18, 385, 220, 19}, 11, muted);
+                label(ui, "连接码  " + snapshot.code, {qr_left + 18, 402, 220, 26}, 16, text, true);
+            }
             if (!networks.empty() && button(ui, "复制链接", {qr_left + 18, 430, 102, 32})) {
                 view.status = window.try_set_clipboard(invitation) ? "邀请链接已复制" : "无法写入剪贴板";
             }
@@ -226,13 +260,16 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session, con
             view.status = "会话已结束";
         }
     } else {
-        label(ui, "开始会话后可用手机扫码", {qr_left + 18, 170, 220, 30}, 13, muted);
+        label(ui, "当前没有会话", {qr_left + 18, 170, 220, 30}, 13, muted);
         if (button(ui, "新建会话", {qr_left + 18, 217, 220, 38}, true)) {
             session.start();
             view.status.clear();
         }
     }
+}
 
+void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
+                  const tempshare::Snapshot& snapshot, View& view, float x, float transfer_width, float bottom) {
     card(ui, {x, 106, transfer_width, 120});
     label(ui, "发送文件", {x + 18, 119, transfer_width - 36, 30}, 16, text, true);
 #ifdef _WIN32
@@ -241,35 +278,46 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session, con
     label(ui, "选择文件，或在设置中输入文件路径", {x + 18, 151, transfer_width - 36, 25}, 13, muted);
 #endif
     if (snapshot.active && button(ui, "选择文件", {x + 18, 181, 114, 32}, true)) {
-        share_paths(session, view, choose_paths(false));
+        share_paths(session, view, pick_paths(view, false));
     }
     if (snapshot.active && !view.archive.valid() && button(ui, "分享文件夹", {x + 141, 181, 115, 32})) {
         share_folder(session, window, view, snapshot);
     }
-    const auto pairing = snapshot.pairing;
-    if (pairing && pairing->state == State::pending) {
-        card(ui, {x, 239, transfer_width, 96});
-        label(ui, pairing->name + " 申请连接", {x + 18, 246, transfer_width - 36, 29}, 15, text, true);
-        label(ui, "核对浏览器验证码  " + pairing->verification, {x + 18, 275, transfer_width - 36, 23},
-              13, online);
-        if (button(ui, "允许", {x + 18, 302, 66, 26}, true)) session.decide_pairing(pairing->token, true);
-        if (button(ui, "拒绝", {x + 93, 302, 66, 26})) session.decide_pairing(pairing->token, false);
-    }
-    const float list_y = pairing && pairing->state == State::pending ? 348.0f : 241.0f;
-    label(ui, "待接收文件", {x, list_y, transfer_width, 26}, 16, text, true);
+    constexpr float list_y = 245.0f;
+    label(ui, "接收请求", {x, list_y, 104, 26}, 16, text, true);
     std::vector<const tempshare::Offer*> pending;
     for (const auto& offer : snapshot.offers) {
         if (offer.state == State::pending || offer.state == State::approved || offer.state == State::uploading) {
             pending.push_back(&offer);
         }
     }
-    const auto offer_start = page_controls(ui, view.offer_page, pending.size(), 2, x, list_y, transfer_width);
-    float row = list_y + 32;
+    std::stable_partition(pending.begin(), pending.end(), [](const tempshare::Offer* offer) {
+        return offer->state == State::pending;
+    });
+    const auto offer_start = page_controls(ui, view.offer_page, pending.size(), 3, x, list_y, transfer_width);
+    std::vector<std::string> visible;
+    std::uint64_t visible_bytes = 0;
+    for (std::size_t i = offer_start; i < std::min(offer_start + 3, pending.size()); ++i) {
+        if (pending[i]->state == State::pending) {
+            visible.push_back(pending[i]->id);
+            visible_bytes += pending[i]->size;
+        }
+    }
+    if (visible.size() > 1 && button(ui, "接收本页 " + std::to_string(visible.size()) + " 个",
+                                     {x + 104, list_y, 92, 28}, true)) {
+        const auto count = session.decide_offers(visible, true);
+        view.status = "已接受 " + std::to_string(count) + " 个文件";
+        if (count < visible.size()) view.status += "，部分请求已变化或超出会话接收上限";
+    }
+    if (visible.size() > 1 && transfer_width >= 400) {
+        label(ui, readable_size(visible_bytes), {x + 205, list_y, 76, 28}, 12, muted);
+    }
+    float row = list_y + 34;
     if (pending.empty()) {
         label(ui, "暂无接收请求", {x, row, transfer_width, 26}, 13, muted);
         row += 36;
     } else {
-        for (std::size_t i = offer_start; i < std::min(offer_start + 2, pending.size()); ++i, row += 48) {
+        for (std::size_t i = offer_start; i < std::min(offer_start + 3, pending.size()); ++i, row += 48) {
             const auto& offer = *pending[i];
             const auto id = static_cast<std::uint64_t>(std::hash<std::string>{}(offer.id));
             card(ui, {x, row, transfer_width, 42});
@@ -279,7 +327,7 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session, con
             label(ui, note, {x + 12, row + 22, transfer_width - 142, 16}, 11, muted);
             if (offer.state == State::pending) {
                 if (button(ui, "接收", {x + transfer_width - 123, row + 7, 52, 28}, true, id)) {
-                    session.decide_offer(offer.id, true);
+                    if (!session.decide_offer(offer.id, true)) view.status = "请求已变化或超出会话接收上限";
                 }
                 if (button(ui, "拒绝", {x + transfer_width - 64, row + 7, 52, 28}, false, id + 1)) {
                     session.decide_offer(offer.id, false);
@@ -290,17 +338,19 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session, con
         }
     }
     label(ui, "已分享文件", {x, row, transfer_width, 28}, 16, text, true);
-    const auto first = page_controls(ui, view.file_page, snapshot.shared.size(), 3, x, row, transfer_width);
     row += 34;
-    if (snapshot.shared.empty()) label(ui, "暂无分享文件", {x, row, transfer_width, 26}, 13, muted);
-    for (std::size_t i = first; i < std::min(first + 3, snapshot.shared.size()); ++i, row += 44) {
-        const auto& file = snapshot.shared[i];
-        card(ui, {x, row, transfer_width, 38});
-        label(ui, file.name + "  ·  " + readable_size(file.size),
-              {x + 12, row + 2, transfer_width - 82, 34}, 13);
-        if (button(ui, "移除", {x + transfer_width - 61, row + 5, 50, 28}, false,
-                   std::hash<std::string>{}(file.id))) session.unshare(file.id);
+    if (snapshot.shared.empty()) {
+        label(ui, "暂无分享文件", {x, row, transfer_width, 26}, 13, muted);
+        return;
     }
+    ui.scroll({x, row, transfer_width, std::max(45.0f, bottom - row)},
+        static_cast<int>(snapshot.shared.size()), 44.0f, [&](int index, const Rect& box) {
+            const auto& file = snapshot.shared[static_cast<std::size_t>(index)];
+            card(ui, {box.x, box.y, box.w - 10, 38});
+            label(ui, file.name + "  ·  " + readable_size(file.size), {box.x + 12, box.y + 2, box.w - 92, 34}, 13);
+            if (button(ui, "移除", {box.x + box.w - 71, box.y + 5, 50, 28}, false,
+                       std::hash<std::string>{}(file.id))) session.unshare(file.id);
+        });
 }
 
 void render_nearby(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers, float x, float width) {
@@ -319,17 +369,24 @@ void render_nearby(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers
     }
 }
 
-void render_received(Ui& ui, View& view, const tempshare::Snapshot& snapshot, float x, float width) {
+void render_received(Ui& ui, View& view, const tempshare::Snapshot& snapshot, float x, float width, float bottom) {
     const auto& files = snapshot.received;
-    const auto first = page_controls(ui, view.received_page, files.size(), 7, x, 105, width);
-    if (files.empty()) label(ui, "本次运行还没有收到文件", {x, 109, width, 32}, 14, muted);
-    float y = 146;
-    for (auto i = first; i < std::min(first + 7, files.size()); ++i, y += 56) {
-        const auto& file = files[files.size() - 1 - i];
-        card(ui, {x, y, width, 50});
-        label(ui, file.name + "  ·  " + readable_size(file.size), {x + 14, y + 3, width - 28, 24}, 15, text, true);
-        label(ui, file.path.u8string(), {x + 14, y + 26, width - 28, 17}, 12, muted);
+    if (files.empty()) {
+        label(ui, "本次运行还没有收到文件", {x, 109, width, 32}, 14, muted);
+        return;
     }
+    ui.scroll({x, 106, width, bottom - 106}, static_cast<int>(files.size()), 56.0f,
+        [&](int index, const Rect& box) {
+            const auto& file = files[files.size() - 1 - static_cast<std::size_t>(index)];
+            card(ui, {box.x, box.y, box.w - 10, 50});
+            label(ui, file.name + "  ·  " + readable_size(file.size), {box.x + 14, box.y + 3, box.w - 132, 24},
+                  15, text, true);
+            label(ui, file.path.u8string(), {box.x + 14, box.y + 26, box.w - 132, 17}, 12, muted);
+            if (button(ui, "打开目录", {box.x + box.w - 109, box.y + 10, 84, 30}, false,
+                       std::hash<std::string>{}(file.id)) && !open_folder(file.path.parent_path())) {
+                view.status = "无法打开接收目录";
+            }
+        });
 }
 
 std::filesystem::path receive_directory(const Options& options, const std::filesystem::path& config) {
@@ -378,7 +435,7 @@ void render_settings(Ui& ui, View& view, tempshare::Session& session, const temp
         update_directory(std::filesystem::absolute(std::filesystem::u8path(view.folder)));
     }
     if (button(ui, "浏览", {x + width - 102, 199, 84, 32})) {
-        const auto paths = choose_paths(true);
+        const auto paths = pick_paths(view, true);
         if (!paths.empty()) update_directory(paths.front());
     }
 
@@ -446,7 +503,7 @@ void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
     card(ui, {x, 106, width, 193});
     label(ui, "发送文本、链接或代码", {x + 18, 118, width - 36, 30}, 16, text, true);
     if (!paired(snapshot) || !snapshot.permissions.text) {
-        label(ui, paired(snapshot) ? "当前会话的文本权限已关闭" : "请先在文件分享页配对浏览器",
+        label(ui, paired(snapshot) ? "当前会话的文本权限已关闭" : "连接设备后即可发送",
               {x + 18, 151, width - 36, 30}, 14, muted);
         return;
     }
@@ -467,7 +524,7 @@ void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
             window.wake();
         });
     }
-    if (button(ui, "分享图片", {x + 218, 252, 97, 32})) share_paths(session, view, choose_paths(false));
+    if (button(ui, "分享图片", {x + 218, 252, 97, 32})) share_paths(session, view, pick_paths(view, false));
     label(ui, "本会话的内容", {x, 313, width, 30}, 16, text, true);
     if (!snapshot.messages.empty() && button(ui, "清空", {x + width - 65, 313, 65, 30})) {
         session.clear_messages();
@@ -490,12 +547,13 @@ void render_cast(Ui& ui, tempshare::Session& session, const tempshare::HttpServe
     card(ui, {x, 106, width, 190});
     label(ui, "共享屏幕或窗口", {x + 18, 120, width - 36, 32}, 17, text, true);
     if (!paired(snapshot)) {
-        label(ui, "请先在文件分享页配对观看设备", {x + 18, 156, width - 36, 28}, 14, muted);
+        label(ui, "连接设备后即可共享", {x + 18, 156, width - 36, 28}, 14, muted);
         return;
     }
-    label(ui, "在本机浏览器选择共享来源，再让对方打开网页的屏幕投递页。",
-          {x + 18, 157, width - 36, 26}, 13, muted);
-    if (button(ui, snapshot.casting ? "重新打开投递控制台" : "打开投递控制台",
+    label(ui, snapshot.viewer_answered ? "正在向对方投递" : snapshot.capture_ready ? "等待对方观看" :
+          snapshot.casting ? "等待本机选择共享来源" : "当前未共享",
+          {x + 18, 157, width - 36, 26}, 13, snapshot.capture_ready ? online : muted);
+    if (!snapshot.capture_ready && button(ui, snapshot.casting ? "重新打开来源选择" : "选择共享来源",
                {x + 18, 210, 170, 36}, true)) {
         const auto key = session.open_cast();
         if (key.empty() || !open_url(server.url("127.0.0.1") + "cast#" + key)) {
@@ -520,8 +578,8 @@ int run(const Options& options) {
 
     std::vector<std::filesystem::path> dropped;
     aino::Window window(config);
-    if (!window.ok()) return 1;
-    auto theme = aino::Theme::dark();
+    if (!window.ok()) throw std::runtime_error("无法创建 TempShare 窗口");
+    auto theme = aino::Theme::light();
     theme.tint = accent;
     window.set_theme(theme);
 #ifdef _WIN32
@@ -530,7 +588,8 @@ int run(const Options& options) {
     const auto repaint = [&window] { window.wake(); };
     const auto config_path = configuration_directory();
     const auto trust_path = options.cert.empty() || config_path.empty() ? std::filesystem::path{} : config_path / "trusted";
-    tempshare::Session session(receive_directory(options, config_path), repaint, std::chrono::minutes(30), trust_path);
+    const auto inbox = receive_directory(options, config_path);
+    tempshare::Session session(inbox, repaint, std::chrono::minutes(30), trust_path);
     tempshare::HttpServer http(session, options.cert, options.key);
     if (!http.start(options.port)) throw std::runtime_error("Unable to start TempShare HTTP service. Check TLS configuration.");
     tempshare::Discovery discovery(http.port(), !options.cert.empty(), [&http] { return http.networks(); }, repaint);
@@ -541,6 +600,7 @@ int run(const Options& options) {
     std::condition_variable timer_cv;
     bool exiting = false;
     std::thread timer([&] {
+        tempshare::clean_interrupted_uploads(inbox);
         std::unique_lock lock(timer_mutex);
         while (!timer_cv.wait_for(lock, std::chrono::seconds(1), [&] { return exiting; })) {
             session.expire();
@@ -565,17 +625,20 @@ int run(const Options& options) {
                 view.status = view.archive.get();
             }
             if (!dropped.empty()) share_paths(session, view, std::exchange(dropped, {}));
-            const auto snapshot = session.snapshot();
+            auto snapshot = session.snapshot(view.page);
             const float height = static_cast<float>(window.height());
             const float width = static_cast<float>(window.width());
             constexpr float side_width = 170;
+            constexpr float navigation_inset = 12;
+            constexpr float navigation_width = side_width - navigation_inset * 2;
             constexpr float x = side_width + 28;
-            const float content_width = width - x - 28;
+            const float rail_left = width - 284;
+            const float content_width = rail_left - x - 18;
             ui.clear(background);
             ui.fill_rect({0, 0, side_width, height}, sidebar);
-            ui.fill_rect_grad({17, 22, 30, 30}, Color{67, 185, 249}, accent, 9);
-            ui.draw_text("ϟ", {17, 22, 30, 30}, text, Style().font(21).bold().center());
-            label(ui, "TempShare", {56, 20, 104, 34}, 17, text, true);
+            ui.fill_rect({17, 22, 30, 30}, accent, 7);
+            ui.draw_text("ϟ", {17, 22, 30, 30}, surface, Style().font(21).bold().center());
+            label(ui, "TempShare", {56, 20, 104, 34}, 16, text, true);
             if (view.previous_invitation != snapshot.invitation) {
                 view.previous_invitation = snapshot.invitation;
                 view.draft.clear();
@@ -584,38 +647,44 @@ int run(const Options& options) {
             const std::array<const char*, 7> titles{
                 "文件分享", "内容同步", "屏幕投递", "附近设备", "接收记录", "设备信任", "设置"
             };
+            constexpr std::array<View::Page, 7> pages{View::Page::share, View::Page::sync, View::Page::cast,
+                View::Page::nearby, View::Page::received, View::Page::devices, View::Page::settings};
             for (std::size_t i = 0; i < titles.size(); ++i) {
-                const auto page = static_cast<View::Page>(i);
-                if (button(ui, titles[i], {17, 91 + 50 * static_cast<float>(i), 136, 40}, page == view.page)) {
+                const auto page = pages[i];
+                const float y = 80 + 42 * static_cast<float>(i) + (i >= 3 ? 21 : 0);
+                const bool selected = page == view.page;
+                auto style = Style().font(13).corner(7).id(i + 100);
+                if (selected) style.background(Color{220, 235, 255}).color(accent);
+                else style.secondary();
+                if (ui.button(titles[i], {navigation_inset, y, navigation_width, 34}, style)) {
                     view.page = page;
+                    snapshot = session.snapshot(view.page);
                     view.status.clear();
                 }
             }
-            label(ui, !options.cert.empty() ? "HTTPS" : "局域网 HTTP",
-                  {20, height - 75, 130, 25}, 13, !options.cert.empty() ? online : muted);
-            label(ui, snapshot.active ? "会话有效期 30 分钟" : "会话未开启", {20, height - 47, 130, 24}, 12, muted);
-            label(ui, titles[static_cast<std::size_t>(view.page)], {x, 20, content_width, 44}, 28, text, true);
-            const std::array<const char*, 7> subtitles{
-                "在同一局域网内，把文件传到另一台设备",
-                "发送文本、链接、代码和图片",
-                "让已配对的设备观看你的屏幕",
-                "选择设备，在浏览器中输入对方屏幕上的连接码",
-                "已保存到本机的文件", "管理可快速重连的设备", "管理接收目录和会话权限"
-            };
-            label(ui, subtitles[static_cast<std::size_t>(view.page)], {x, 66, content_width, 26}, 14, muted);
+            ui.fill_rect({23, 212, 124, 1}, border);
+            label(ui, "本地连接", {21, height - 81, 128, 22}, 12, muted);
+            label(ui, snapshot.active ? "会话进行中" : "尚未开始会话",
+                  {21, height - 56, 132, 24}, 12, snapshot.active ? online : muted);
+            const auto page = view.page;
+            render_connection(ui, window, session, http, snapshot, http.networks(), view, rail_left);
+            if (page != view.page) snapshot = session.snapshot(view.page);
+            const auto index = static_cast<std::size_t>(std::find(pages.begin(), pages.end(), view.page) - pages.begin());
+            label(ui, titles[index], {x, 28, content_width, 50}, 28, text, true);
 
             switch (view.page) {
+            case View::Page::all: break;
             case View::Page::share:
-                render_share(ui, window, session, http, snapshot, http.networks(), view, x, content_width);
+                render_share(ui, window, session, snapshot, view, x, content_width, height - 53);
                 break;
             case View::Page::sync: render_sync(ui, window, session, snapshot, view, x, content_width); break;
             case View::Page::cast: render_cast(ui, session, http, snapshot, view, x, content_width); break;
             case View::Page::nearby: render_nearby(ui, view, discovery.peers(), x, content_width); break;
-            case View::Page::received: render_received(ui, view, snapshot, x, content_width); break;
+            case View::Page::received: render_received(ui, view, snapshot, x, content_width, height - 53); break;
             case View::Page::devices: render_devices(ui, session, snapshot, view, x, content_width); break;
             case View::Page::settings: render_settings(ui, view, session, snapshot, config_path, x, content_width); break;
             }
-            label(ui, view.status, {x, height - 43, content_width, 27}, 13, online);
+            label(ui, view.status, {x, height - 43, content_width, 27}, 12, muted);
         });
     } catch (...) {
         session.end();
@@ -631,6 +700,29 @@ int run(const Options& options) {
 
 }  // namespace
 
+#ifdef _WIN32
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    try {
+        int argc = 0;
+        auto* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        if (!argv) throw std::runtime_error("无法读取启动参数");
+        const std::unique_ptr<wchar_t*, decltype(&LocalFree)> arguments(argv, LocalFree);
+        std::vector<std::string> values;
+        std::vector<char*> pointers;
+        values.reserve(argc);
+        for (int i = 0; i < argc; ++i) values.push_back(std::filesystem::path(argv[i]).u8string());
+        for (auto& value : values) pointers.push_back(value.data());
+        return run(parse_options(argc, pointers.data()));
+    } catch (const std::exception& error) {
+        const std::string description(error.what());
+        const auto size = MultiByteToWideChar(CP_UTF8, 0, description.c_str(), -1, nullptr, 0);
+        std::wstring wide(static_cast<std::size_t>(size), L'\0');
+        if (size > 0) MultiByteToWideChar(CP_UTF8, 0, description.c_str(), -1, wide.data(), size);
+        MessageBoxW(nullptr, size > 0 ? wide.c_str() : L"TempShare 启动失败", L"TempShare", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+}
+#else
 int main(int argc, char** argv) {
     try {
         return run(parse_options(argc, argv));
@@ -639,3 +731,4 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+#endif

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/shared_source.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -15,9 +17,13 @@
 namespace tempshare {
 
 inline constexpr std::uint64_t max_file_size = 1024ULL * 1024 * 1024;
+inline constexpr std::uint64_t max_session_bytes = 4ULL * 1024 * 1024 * 1024;
+inline constexpr std::uint64_t minimum_free_bytes = 16ULL * 1024 * 1024;
 inline constexpr std::size_t max_text_size = 32 * 1024;
 
 enum class State { pending, approved, rejected, uploading, complete };
+enum class UploadFailure { unavailable, storage, insufficient_space };
+enum class SnapshotPage { all, share, sync, received, devices, settings, cast, nearby };
 
 struct Pairing {
     std::string token;
@@ -32,6 +38,7 @@ struct File {
     std::string name;
     std::uint64_t size;
     std::filesystem::path path;
+    std::optional<SourceVersion> source{};
     std::shared_ptr<const std::filesystem::path> temporary_directory{};
 };
 
@@ -65,6 +72,7 @@ struct CastSignal {
     std::string answer;
     bool viewing = false;
     unsigned revision = 0;
+    bool ready = false;
 };
 
 struct Snapshot {
@@ -81,6 +89,8 @@ struct Snapshot {
     bool casting = false;
     bool trust_enabled = false;
     std::vector<TrustedDevice> trusted;
+    bool capture_ready = false;
+    bool viewer_answered = false;
 };
 
 struct Upload {
@@ -100,7 +110,7 @@ public:
     bool is_active() const;
     bool expire();
     bool invitation_active(std::string_view invitation) const;
-    Snapshot snapshot() const;
+    Snapshot snapshot(SnapshotPage page = SnapshotPage::all) const;
     bool set_directory(std::filesystem::path directory);
     bool share(const std::filesystem::path& path);
     bool share_archive(std::string_view invitation, std::string name,
@@ -109,6 +119,7 @@ public:
     bool decide_pairing(const std::string& token, bool accept);
     bool disconnect(std::string_view token);
     bool decide_offer(const std::string& id, bool accept);
+    std::size_t decide_offers(const std::vector<std::string>& ids, bool accept);
     void set_permissions(Permissions permissions);
     Permissions permissions() const;
     bool send_text(std::string text);
@@ -120,9 +131,11 @@ public:
     std::string open_cast();
     bool stop_cast(std::string_view token = {});
     std::optional<CastSignal> cast_host(std::string_view token);
-    std::optional<CastSignal> cast_viewer(std::string_view token, bool viewing);
+    bool cast_ready(std::string_view token);
+    std::optional<bool> capture_ready(std::string_view token) const;
+    std::optional<CastSignal> cast_viewer(std::string_view token, bool viewing, std::string_view viewer = {});
     bool cast_offer(std::string_view token, std::string sdp);
-    bool cast_answer(std::string_view token, unsigned revision, std::string sdp);
+    bool cast_answer(std::string_view token, unsigned revision, std::string sdp, std::string_view viewer = {});
 
     std::optional<Pairing> pair(std::string_view invitation, std::string name = "浏览器");
     std::optional<Pairing> reconnect(std::string_view trusted);
@@ -130,13 +143,17 @@ public:
     bool revoke_device(const std::string& key);
     std::optional<Pairing> pairing(std::string_view token) const;
     bool authorized(std::string_view token) const;
+    bool upload_allowed(std::string_view token) const;
     bool downloading(std::string_view token, const std::string& id) const;
     std::optional<std::vector<File>> shared(std::string_view token) const;
     std::optional<Offer> offer(std::string_view token, std::string name, std::uint64_t size);
     std::optional<std::vector<Offer>> offers(std::string_view token) const;
+    std::uint64_t files_revision() const;
+    std::uint64_t offers_revision() const;
     bool cancel_offer(std::string_view token, const std::string& id);
     std::optional<Upload> begin_upload(std::string_view token, const std::string& id,
-                                       std::uint64_t size, std::optional<std::uint64_t> offset = {});
+                                       std::uint64_t size, std::optional<std::uint64_t> offset = {},
+                                       UploadFailure* failure = nullptr);
     bool uploading(std::string_view token, const std::string& id) const;
     bool finish_upload(std::string_view token, const std::string& id, const Upload& upload,
                        std::optional<std::uint64_t> transferred = {});
@@ -149,20 +166,23 @@ private:
     bool add_message(std::string text, bool from_desktop);
     bool cast_available() const;
     bool cast_host_access(std::string_view token) const;
-    void notify() const;
 
     mutable std::mutex mutex_;
     std::function<void()> changed_;
     Clock::duration lifetime_;
     Clock::time_point expires_{};
     Clock::time_point retry_after_{};
+    Clock::time_point pairing_deadline_{};
     unsigned failed_codes_ = 0;
     std::string invitation_;
     std::string code_;
     std::optional<Pairing> pairing_;
     std::vector<Offer> offers_;
+    std::uint64_t offers_revision_ = 0;
+    std::uint64_t committed_bytes_ = 0;
     std::unordered_map<std::string, Upload> partials_;
     std::vector<File> shared_;
+    std::uint64_t files_revision_ = 0;
     std::vector<File> received_;
     std::filesystem::path directory_;
     std::filesystem::path staging_;
@@ -176,11 +196,13 @@ private:
     unsigned cast_revision_ = 0;
     Clock::time_point cast_host_seen_{};
     Clock::time_point cast_viewer_seen_{};
+    std::string cast_viewer_id_;
 };
 
 std::string random_token();
 std::string json_string(std::string_view value);
 std::string_view state_name(State state);
 bool valid_filename(std::string_view name);
+void clean_interrupted_uploads(const std::filesystem::path& directory);
 
 }  // namespace tempshare

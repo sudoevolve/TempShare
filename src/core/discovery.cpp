@@ -4,6 +4,7 @@
 #include <charconv>
 #include <optional>
 #include <string_view>
+#include <string>
 #include <utility>
 
 #ifdef _WIN32
@@ -14,7 +15,7 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -67,7 +68,7 @@ std::string format_address(const in_addr& address) {
 
 bool private_address(std::uint32_t ip) {
     return (ip >> 24) == 10 || (ip >> 20) == 0xac1 ||
-           (ip >> 16) == 0xc0a8 || (ip >> 16) == 0xa9fe;
+           (ip >> 16) == 0xc0a8;
 }
 
 void add_network(std::vector<LocalNetwork>& networks, const sockaddr* address, std::uint32_t mask) {
@@ -130,6 +131,11 @@ bool LocalNetwork::contains(const std::string& other) const {
     return private_address(candidate) && (candidate & mask) == (ip & mask);
 }
 
+bool is_private_ipv4(const std::string& address) {
+    in_addr native{};
+    return inet_pton(AF_INET, address.c_str(), &native) == 1 && private_address(ntohl(native.s_addr));
+}
+
 std::vector<LocalNetwork> lan_networks() {
     std::vector<LocalNetwork> networks;
 #ifdef _WIN32
@@ -164,6 +170,21 @@ std::vector<LocalNetwork> lan_networks() {
                 const auto prefix = unicast->OnLinkPrefixLength;
                 if (prefix > 0 && prefix <= 32) {
                     add_network(networks, unicast->Address.lpSockaddr, 0xffffffffu << (32 - prefix));
+                    const auto local = format_address(reinterpret_cast<const sockaddr_in*>(
+                        unicast->Address.lpSockaddr)->sin_addr);
+                    const auto found = std::find_if(networks.begin(), networks.end(), [&](const LocalNetwork& network) {
+                        return network.address == local;
+                    });
+                    if (found != networks.end()) {
+                        const auto* name = choice.second->FriendlyName;
+                        const auto length = name ? WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr) : 0;
+                        if (length > 1) {
+                            found->interface_name.resize(static_cast<std::size_t>(length));
+                            WideCharToMultiByte(CP_UTF8, 0, name, -1, found->interface_name.data(), length, nullptr, nullptr);
+                            found->interface_name.pop_back();
+                        }
+                        found->wireless = choice.second->IfType == IF_TYPE_IEEE80211;
+                    }
                 }
             }
         }
@@ -176,6 +197,15 @@ std::vector<LocalNetwork> lan_networks() {
                 entry->ifa_netmask && entry->ifa_netmask->sa_family == AF_INET) {
                 const auto mask = reinterpret_cast<const sockaddr_in*>(entry->ifa_netmask)->sin_addr;
                 add_network(networks, entry->ifa_addr, ntohl(mask.s_addr));
+                const auto local = format_address(reinterpret_cast<const sockaddr_in*>(entry->ifa_addr)->sin_addr);
+                const auto found = std::find_if(networks.begin(), networks.end(), [&](const LocalNetwork& network) {
+                    return network.address == local;
+                });
+                if (found != networks.end()) {
+                    found->interface_name = entry->ifa_name;
+                    found->wireless = std::string_view(entry->ifa_name).rfind("wlan", 0) == 0 ||
+                        std::string_view(entry->ifa_name).rfind("wlp", 0) == 0;
+                }
             }
         }
         freeifaddrs(interfaces);
@@ -199,6 +229,14 @@ std::vector<LocalNetwork> lan_networks() {
     }
 #endif
     return networks;
+}
+
+bool permits_private_lan_peer(const std::vector<LocalNetwork>& interfaces,
+                              const std::string& local, const std::string& remote) {
+    return is_private_ipv4(remote) &&
+        std::any_of(interfaces.begin(), interfaces.end(), [&](const LocalNetwork& network) {
+            return network.address == local;
+        });
 }
 
 Discovery::Discovery(unsigned short port, bool secure, std::function<std::vector<LocalNetwork>()> networks,
@@ -274,16 +312,17 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
             next_send = now + std::chrono::seconds(3);
         }
         bool changed = false;
+#ifdef _WIN32
         fd_set readable;
         FD_ZERO(&readable);
         FD_SET(socket.fd, &readable);
         timeval timeout{0, 200000};
-#ifdef _WIN32
-        constexpr int highest = 0;
+        const bool readable_socket = select(0, &readable, nullptr, nullptr, &timeout) > 0;
 #else
-        const int highest = socket.fd + 1;
+        pollfd readable{socket.fd, POLLIN, 0};
+        const bool readable_socket = poll(&readable, 1, 200) > 0 && (readable.revents & POLLIN);
 #endif
-        if (select(highest, &readable, nullptr, nullptr, &timeout) > 0) {
+        if (readable_socket) {
             char incoming[160]{};
             sockaddr_in source{};
             AddressLength size = sizeof(source);

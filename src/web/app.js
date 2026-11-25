@@ -1,6 +1,7 @@
 'use strict';
 
 import { gather, peerConnection } from './rtc.js';
+import { fingerprint, forgetUpload, rememberUpload, resumableUploads } from './resume.js';
 
 const byId = (id) => document.getElementById(id);
 const pairForm = byId('pair-form');
@@ -20,17 +21,26 @@ let interrupted = false;
 let tab = 'share';
 let shownMessages = '';
 let knownTextRevision = -1;
+let knownFilesRevision = -1;
+let knownOffersRevision = -1;
+let knownOffers = [];
 let watching = false;
 let castPeer;
 let castRevision = 0;
 let castGeneration = 0;
+let castViewer = '';
 let refreshingCast = false;
+let captureReady = false;
+let shownRecovery = '';
 const trustedConnect = byId('trusted-connect');
 trustedConnect.hidden = location.protocol !== 'https:';
+byId('resume-option').hidden = location.protocol !== 'https:' || !crypto.subtle;
 
 function message(text, error = false) {
-  byId('message').textContent = text;
-  byId('message').classList.toggle('error', error);
+  const notice = byId('message');
+  notice.textContent = text;
+  notice.hidden = !text;
+  notice.classList.toggle('error', error);
 }
 
 function showConnection(state, verification = '') {
@@ -44,7 +54,10 @@ function showConnection(state, verification = '') {
   connection = state;
   byId('connection').dataset.state = state;
   byId('connection').textContent = badge;
-  byId('disconnect').hidden = state === '';
+  const disconnect = byId('disconnect');
+  disconnect.hidden = state === '';
+  disconnect.textContent = state === 'pending' ? '取消请求' : '断开';
+  byId('retry-connection').hidden = state !== '' || pairing;
   byId('connect-title').textContent = title;
   byId('connect-description').textContent = description;
   byId('connect-panel').hidden = state === 'approved';
@@ -64,7 +77,13 @@ function showConnection(state, verification = '') {
     showDownloads([]);
     showMessages([]);
     knownTextRevision = -1;
+    knownFilesRevision = -1;
+    knownOffersRevision = -1;
+    knownOffers = [];
+    forgetUpload();
+    showRecovery([]);
     byId('sync-text').value = '';
+    showCastAvailability(false);
     stopViewing(false);
     message('连接已结束或被拒绝，请使用电脑上显示的新连接码。', true);
   } else if (changed) {
@@ -102,14 +121,16 @@ async function askToPair(invitation) {
       'X-Device-Name': encodeURIComponent(device),
     });
     if (!response.ok) {
-      message('连接码或邀请不可用。请核对电脑上的连接码。', true);
+      message(response.status === 403
+        ? '电脑拒绝了此连接。请查看桌面端的连接码并核对当前局域网地址。'
+        : '连接码已过期或不正确，请核对电脑上显示的连接码。', true);
       return;
     }
     const data = await response.json();
     showConnection('pending', data.verification);
     byId('pair-code').value = '';
   } catch {
-    message('无法连接到电脑，请检查 Wi-Fi 后重试。', true);
+    message(`无法连接到 ${location.host}。请连接电脑所在的家庭或办公网络，关闭访客隔离后重试。`, true);
   } finally {
     pairing = false;
     pairForm.querySelector('button').disabled = false;
@@ -228,6 +249,13 @@ function castStatus(text) {
   byId('cast-status').textContent = text;
 }
 
+function showCastAvailability(ready) {
+  captureReady = ready;
+  byId('cast-ready').hidden = !ready;
+  byId('cast-watch').disabled = !ready && !watching;
+  if (!watching) castStatus(ready ? '电脑已选择共享来源。' : '等待电脑选择共享来源。');
+}
+
 function clearCastPeer() {
   const previous = castPeer;
   castPeer = undefined;
@@ -240,13 +268,14 @@ function clearCastPeer() {
 
 function stopViewing(notify = true) {
   const wasWatching = watching;
+  const viewer = castViewer;
   watching = false;
   castGeneration++;
   clearCastPeer();
-  castStatus('');
+  showCastAvailability(captureReady);
   byId('cast-watch').textContent = '开始观看';
   if (notify && wasWatching) fetch('/api/cast/viewer', {
-    method: 'POST', headers: { 'X-TempShare': '1', 'X-Cast-Watch': '0' }, keepalive: true,
+    method: 'POST', headers: { 'X-TempShare': '1', 'X-Cast-Watch': '0', 'X-Cast-Viewer': viewer }, keepalive: true,
   }).catch(() => {});
 }
 
@@ -255,14 +284,24 @@ async function refreshCast() {
   const current = castGeneration;
   refreshingCast = true;
   try {
-    const response = await request('/api/cast/viewer', 'POST', { 'X-Cast-Watch': '1' });
+    const response = await request('/api/cast/viewer', 'POST', { 'X-Cast-Watch': '1', 'X-Cast-Viewer': castViewer });
     if (current !== castGeneration) return;
+    if (response.status === 409) {
+      stopViewing(false);
+      castStatus('已有另一个标签页正在观看。');
+      return;
+    }
     if (!response.ok) throw new Error('viewer');
     const signal = await response.json();
     if (current !== castGeneration) return;
     if (!signal.offer) {
       clearCastPeer();
-      castStatus('等待电脑开始投递。');
+      if (!signal.ready) {
+        stopViewing(false);
+        showCastAvailability(false);
+      } else {
+        castStatus('正在连接电脑…');
+      }
       return;
     }
     if (signal.revision === castRevision) return;
@@ -284,7 +323,9 @@ async function refreshCast() {
     await peer.setRemoteDescription({ type: 'offer', sdp: signal.offer });
     const answer = await gather(peer, await peer.createAnswer());
     if (peer !== castPeer) return;
-    const result = await request('/api/cast/answer', 'POST', { 'X-Cast-Revision': String(signal.revision) }, answer);
+    const result = await request('/api/cast/answer', 'POST', {
+      'X-Cast-Revision': String(signal.revision), 'X-Cast-Viewer': castViewer,
+    }, answer);
     if (!result.ok) throw new Error('answer');
   } catch {
     if (current === castGeneration) {
@@ -306,14 +347,18 @@ function updateItem(item, status, progress, failed = false) {
   item.pause.textContent = item.paused ? '继续' : '暂停';
 }
 
-function submitFile(file) {
+function submitFile(file, saved) {
   if (file.size > maxFileSize) {
     message(`${file.name} 超过 1 GiB，未加入队列。`, true);
     return;
   }
-  if (queue.length >= 100) {
+  if (queue.filter((item) => !item.finished && !item.cancelled).length >= 100) {
     message('本会话的文件队列已满。', true);
     return;
+  }
+  if (queue.length >= 200) {
+    const index = queue.findIndex((item) => item.finished || item.cancelled);
+    if (index >= 0) queue.splice(index, 1)[0].row.remove();
   }
   const { row, meta } = fileRow(file.name, '');
   const controls = element('div', 'file-action');
@@ -325,13 +370,16 @@ function submitFile(file) {
   progress.setAttribute('aria-label', `${file.name} 发送进度`);
   controls.append(retry, pause, cancel);
   row.append(controls, progress);
-  const item = { file, meta, progress, retry, pause, cancel, generation, offset: 0 };
+  const item = { file, row, meta, progress, retry, pause, cancel, generation, offset: 0,
+    id: saved?.id, keep: byId('remember-uploads').checked && !byId('resume-option').hidden };
   queue.push(item);
   retry.addEventListener('click', () => {
     if (item.request || item.cancelled) return;
     if (item.id) {
       item.failed = false;
       updateItem(item, '等待上传');
+      knownOffersRevision = -1;
+      poll();
     } else {
       sendOffer(item);
     }
@@ -345,13 +393,62 @@ function submitFile(file) {
   cancel.addEventListener('click', () => cancelItem(item));
   byId('upload-list').append(row);
   byId('uploads').hidden = false;
-  sendOffer(item);
+  if (saved) {
+    updateItem(item, '正在恢复上传…');
+    syncUploads(knownOffers);
+    showRecovery(knownOffers);
+  } else {
+    sendOffer(item);
+  }
+}
+
+function showRecovery(offers) {
+  const available = new Set(offers.filter(({ state }) => state === 'pending' || state === 'approved' ||
+    state === 'uploading').map(({ id }) => id));
+  const records = resumableUploads().filter(({ id }) => available.has(id) && !queue.some((item) => item.id === id));
+  const rendered = JSON.stringify(records);
+  if (shownRecovery === rendered) return;
+  shownRecovery = rendered;
+  byId('resume-list').replaceChildren(...records.map((saved) => {
+    const { row, meta } = fileRow(saved.name, '重新选择原文件以继续');
+    const input = element('input', 'resume-picker');
+    input.type = 'file';
+    input.setAttribute('aria-label', '恢复 ' + saved.name);
+    meta.after(input);
+    input.addEventListener('change', async () => {
+      const [file] = input.files;
+      if (!file) return;
+      const current = generation;
+      input.disabled = true;
+      try {
+        const same = file.name === saved.name && file.size === saved.size &&
+          await fingerprint(file, () => generation !== current) === saved.digest;
+        if (generation !== current) return;
+        if (!same) throw new Error('Different file');
+        if (!knownOffers.some(({ id, state }) => id === saved.id && state !== 'rejected' && state !== 'complete')) {
+          throw new Error('Offer changed');
+        }
+        submitFile(file, saved);
+      } catch {
+        if (generation === current) message('无法恢复，请选择原文件并确认会话仍有效。', true);
+      } finally {
+        input.value = '';
+        input.disabled = false;
+      }
+    });
+    return row;
+  }));
 }
 
 async function sendOffer(item) {
   item.failed = false;
   updateItem(item, '正在提交');
   try {
+    if (item.keep && !item.digest) {
+      updateItem(item, '正在校验文件…');
+      item.digest = await fingerprint(item.file, () => item.cancelled || item.generation !== generation);
+      if (item.cancelled || item.generation !== generation) return;
+    }
     const response = await request('/api/offers', 'POST', {
       'X-File-Name': encodeURIComponent(item.file.name),
       'X-File-Size': String(item.file.size),
@@ -362,6 +459,9 @@ async function sendOffer(item) {
     if (item.cancelled) {
       cancelItem(item);
     } else {
+      if (item.keep && !rememberUpload({ id: item.id, name: item.file.name, size: item.file.size, digest: item.digest })) {
+        message('浏览器无法保存续传记录，本次仍可上传。', true);
+      }
       updateItem(item, '等待电脑确认');
     }
   } catch {
@@ -380,6 +480,7 @@ async function cancelItem(item) {
     const response = await request(`/api/offers/${item.id}`, 'DELETE');
     if (response.status === 409) updateItem(item, '接收请求已结束');
     else if (!response.ok) throw new Error('cancel');
+    forgetUpload(item.id);
   } catch {
     message('无法通知电脑取消，连接恢复后可结束会话。', true);
   }
@@ -393,6 +494,7 @@ function transfer(item) {
   updateItem(item, '正在发送', item.file.size ? offset / item.file.size * 100 : 0);
   const started = performance.now();
   xhr.open('PUT', `/api/upload/${item.id}`);
+  xhr.timeout = 45000;
   xhr.setRequestHeader('X-TempShare', '1');
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.setRequestHeader('X-Upload-Offset', String(offset));
@@ -415,6 +517,7 @@ function transfer(item) {
     if (xhr.status === 201) {
       item.offset = end;
       if (end === item.file.size) {
+        forgetUpload(item.id);
         item.finished = true;
         updateItem(item, '已保存到电脑');
       } else if (!item.paused) {
@@ -422,7 +525,15 @@ function transfer(item) {
       }
     } else if (!item.paused) {
       item.failed = true;
-      updateItem(item, '发送失败', undefined, true);
+      let code;
+      try { code = JSON.parse(xhr.responseText).code; } catch { /* Empty response after disconnect. */ }
+      const detail = {
+        disk_space: '电脑的接收空间不足',
+        storage_unavailable: '电脑无法写入接收目录',
+        transfer_busy: '电脑正在处理其他传输',
+        upload_unavailable: '等待授权或重新同步进度',
+      };
+      updateItem(item, detail[code] || '发送失败', undefined, true);
     }
   };
   xhr.send(item.file.slice(offset, end));
@@ -437,6 +548,7 @@ function syncUploads(offers) {
     const state = offer?.state;
     if (state === 'rejected' || state === 'complete') {
       item.finished = true;
+      forgetUpload(item.id);
       updateItem(item, state === 'complete' ? '已保存到电脑' : '电脑已拒绝');
     } else if (state === 'approved' && !item.failed && !item.paused) {
       item.approved = true;
@@ -459,14 +571,23 @@ async function poll() {
     const pair = await request('/api/pair');
     if (attempt !== pairingAttempt) return;
     if (pair.status === 401) {
+      forgetUpload();
       showConnection('');
       return;
     }
-    if (!pair.ok) throw new Error('pair');
-    const { state, verification, upload, download, text, textRevision } = await pair.json();
+    if (!pair.ok) {
+      if (connection === '') {
+        message(pair.status === 403
+          ? '此地址拒绝了当前网络中的设备。请核对桌面端显示的地址，并检查访客网络隔离。'
+          : `无法访问 ${location.host}。请确认电脑仍在该局域网运行。`, true);
+      }
+      throw new Error('pair');
+    }
+    const { state, verification, upload, download, text, textRevision, castReady, filesRevision, offersRevision } = await pair.json();
     if (attempt !== pairingAttempt) return;
     showConnection(state, verification);
     if (state !== 'approved') return;
+    showCastAvailability(castReady === true);
     dropzone.hidden = !upload;
     byId('upload-disabled').hidden = upload;
     byId('sync-image-label').hidden = !upload;
@@ -474,22 +595,37 @@ async function poll() {
     byId('sync-disabled').hidden = text;
     const refreshText = text && tab === 'sync' && textRevision !== knownTextRevision;
     const [files, offers, entries] = await Promise.all([
-      request('/api/files'), request('/api/offers'), refreshText ? request('/api/text') : null,
+      filesRevision === undefined || filesRevision !== knownFilesRevision ? request('/api/files') : null,
+      offersRevision === undefined || offersRevision !== knownOffersRevision ? request('/api/offers') : null,
+      refreshText ? request('/api/text') : null,
     ]);
     if (attempt !== pairingAttempt) return;
-    if (files.status === 403 || offers.status === 403) {
+    if (files?.status === 403 || offers?.status === 403) {
       showConnection('');
       return;
     }
-    if (!files.ok || !offers.ok) throw new Error('files');
+    if ((files && !files.ok) || (offers && !offers.ok)) throw new Error('files');
     const [downloads, transfers, history] = await Promise.all([
-      files.json(), offers.json(), entries?.ok ? entries.json() : null,
+      files?.json(), offers?.json(), entries?.ok ? entries.json() : null,
     ]);
     if (attempt !== pairingAttempt) return;
-    showDownloads(downloads);
+    if (downloads) {
+      knownFilesRevision = filesRevision;
+      showDownloads(downloads);
+    }
     if (!download) byId('no-files').textContent = '电脑关闭了文件下载权限。';
-    else byId('no-files').textContent = '电脑分享文件后会显示在这里。';
-    syncUploads(transfers);
+    else byId('no-files').textContent = '暂无共享文件';
+    if (transfers) {
+      knownOffersRevision = offersRevision;
+      knownOffers = transfers;
+      for (const record of resumableUploads()) {
+        if (!knownOffers.some(({ id, state }) => id === record.id && state !== 'complete' && state !== 'rejected')) {
+          forgetUpload(record.id);
+        }
+      }
+    }
+    syncUploads(knownOffers);
+    showRecovery(knownOffers);
     if (history) {
       showMessages(history);
       knownTextRevision = textRevision;
@@ -531,18 +667,27 @@ trustedConnect.addEventListener('click', async () => {
     poll();
   }
 });
+byId('retry-connection').addEventListener('click', () => {
+  if (connection) return poll();
+  const code = byId('pair-code').value.trim();
+  if (code) askToPair(code);
+  else poll();
+});
 byId('feature-nav').addEventListener('click', (event) => {
-  if (event.target.dataset.panel) showTab(event.target.dataset.panel);
+  const button = event.target.closest('button[data-panel]');
+  if (button) showTab(button.dataset.panel);
 });
 byId('sync-form').addEventListener('submit', sendText);
 byId('disconnect').addEventListener('click', async (event) => {
   const button = event.currentTarget;
+  const wasPending = connection === 'pending';
   button.disabled = true;
   try {
     const response = await request('/api/pair', 'DELETE');
     if (!response.ok && response.status !== 401) throw new Error('disconnect');
     pairingAttempt++;
     showConnection('');
+    message(wasPending ? '已取消连接请求。' : '已断开连接。');
   } catch {
     message('无法断开连接，请在电脑上结束会话。', true);
   } finally {
@@ -551,7 +696,7 @@ byId('disconnect').addEventListener('click', async (event) => {
 });
 byId('sync-image').addEventListener('change', (event) => {
   if (connection === 'approved') {
-    Array.from(event.target.files).forEach(submitFile);
+    Array.from(event.target.files).forEach((file) => submitFile(file));
     showTab('share');
   }
   event.target.value = '';
@@ -560,6 +705,7 @@ byId('cast-watch').addEventListener('click', () => {
   if (watching) return stopViewing();
   if (typeof RTCPeerConnection === 'undefined') return castStatus('当前浏览器不支持 WebRTC。');
   watching = true;
+  castViewer = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
   castGeneration++;
   byId('cast-watch').textContent = '停止观看';
   castStatus('等待电脑开始投递。');
@@ -567,7 +713,7 @@ byId('cast-watch').addEventListener('click', () => {
 });
 window.addEventListener('pagehide', () => stopViewing());
 fileInput.addEventListener('change', () => {
-  if (connection === 'approved') Array.from(fileInput.files).forEach(submitFile);
+  if (connection === 'approved') Array.from(fileInput.files).forEach((file) => submitFile(file));
   fileInput.value = '';
 });
 dropzone.addEventListener('dragover', (event) => {
@@ -578,7 +724,7 @@ dropzone.addEventListener('dragleave', () => dropzone.classList.remove('active')
 dropzone.addEventListener('drop', (event) => {
   event.preventDefault();
   dropzone.classList.remove('active');
-  if (connection === 'approved') Array.from(event.dataTransfer.files).forEach(submitFile);
+  if (connection === 'approved') Array.from(event.dataTransfer.files).forEach((file) => submitFile(file));
 });
 
 async function start() {
@@ -586,7 +732,10 @@ async function start() {
   if (invite) history.replaceState(null, '', location.pathname);
   await poll();
   if (!connection && /^[0-9a-f]{32}$/.test(invite)) await askToPair(invite);
-  setInterval(poll, pollInterval);
+  setInterval(() => {
+    if (!document.hidden || watching || queue.some((item) => !item.cancelled && !item.finished)) poll();
+  }, pollInterval);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
   setInterval(refreshCast, 900);
 }
 start();

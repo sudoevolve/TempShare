@@ -25,11 +25,16 @@ struct LocalNetwork {
     std::string address;
     std::uint32_t ip;
     std::uint32_t mask;
+    std::string interface_name;
+    bool wireless = false;
     bool contains(const std::string& other) const;
     bool operator==(const LocalNetwork& other) const { return ip == other.ip && mask == other.mask; }
 };
 
 std::vector<LocalNetwork> lan_networks();
+bool is_private_ipv4(const std::string& address);
+bool permits_private_lan_peer(const std::vector<LocalNetwork>& interfaces,
+                              const std::string& local, const std::string& remote);
 
 class Discovery {
 public:
