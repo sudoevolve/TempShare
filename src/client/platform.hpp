@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -15,19 +16,21 @@ std::optional<bool> system_dark_mode();
 #ifdef _WIN32
 class DesktopIntegration {
 public:
-    explicit DesktopIntegration(std::vector<std::filesystem::path>& paths);
+    DesktopIntegration(std::vector<std::filesystem::path>& paths, std::function<void()> wake);
     ~DesktopIntegration();
     DesktopIntegration(const DesktopIntegration&) = delete;
     DesktopIntegration& operator=(const DesktopIntegration&) = delete;
     bool notify(const std::wstring& title, const std::wstring& message, int connection, bool open_sync = false);
     void minimize() const;
-    bool updates(bool automatic = false) const;
+    bool updates() const;
     std::filesystem::path inbox;
     void* window = nullptr;
     unsigned taskbar_created = 0;
     bool tray = false;
     bool allow_exit = false;
     bool close_prompt = false;
+    bool close_requested = false;
+    std::function<void()> wake;
     int notice_connection = -1;
     int clicked_connection = -1;
     bool notice_opens_sync = false;

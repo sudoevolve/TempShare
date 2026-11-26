@@ -4,7 +4,7 @@
 
 TempShare 让同一私有局域网内的电脑、手机和平板临时连接，分享文件、同步内容和投递屏幕。电脑运行 Aino C++ 桌面客户端，手机扫描二维码或在浏览器中输入连接码即可加入。设备发现、配对和传输均在局域网内完成。不同私有网段之间只有在路由器允许互访时才可连接。
 
-![TempShare 实际运行截图：桌面共享旅行资料文件夹，手机网页浏览并选择下载](docs/preview/image.png)
+![TempShare 桌面应用真实运行截图](docs/preview/image.png)
 
 ## 功能
 
@@ -41,7 +41,7 @@ Windows 也可以从资源管理器双击 `tempshare.exe`。启动错误会在�
 
 Windows x64 安装包通过 GitHub Releases 分发。关闭窗口时可以选择缩小到托盘或退出。点击托盘图标恢复窗口，右键可打开接收目录、检查更新或退出。Windows 会按系统设置显示配对、文件与新消息通知，点击新消息通知可打开对应连接的同步页。 [GitHub Releases](https://github.com/sudoevolve/TempShare/releases)
 
-打开设置中的「检查更新」可从 GitHub 检查新版本，并选择启用每日自动检查。确认后会下载安装包，校验 GitHub 发布的 SHA-256 摘要。公开仓库的检查和下载无需登录，共享功能可离线使用。
+打开设置中的「检查更新」会进入 GitHub 最新稳定版页面。安装包由 GitHub Releases 分发；应用内自动下载和安装尚未提供。共享功能可离线使用。
 
 本地生成安装包需要 Inno Setup 6。构建并通过测试后运行 `packaging/windows/package.ps1`，产物位于 `build/package/`。GitHub 的 Windows installer 工作流可生成同样的文件。
 

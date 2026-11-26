@@ -54,7 +54,7 @@ if(TEMPSHARE_TLS)
 endif()
 
 add_executable(tempshare src/client/main.cpp src/client/platform.cpp "${qrcode_SOURCE_DIR}/cpp/qrcodegen.cpp")
-target_compile_definitions(tempshare PRIVATE TEMPSHARE_VERSION="${PROJECT_VERSION}" TEMPSHARE_WIDE_VERSION=L"${PROJECT_VERSION}")
+target_compile_definitions(tempshare PRIVATE TEMPSHARE_VERSION="${PROJECT_VERSION}")
 target_include_directories(tempshare SYSTEM PRIVATE "${aino_SOURCE_DIR}" "${qrcode_SOURCE_DIR}/cpp")
 target_link_libraries(tempshare PRIVATE tempshare_core Threads::Threads)
 
@@ -86,9 +86,6 @@ foreach(target IN ITEMS tempshare tempshare_core)
 endforeach()
 
 install(TARGETS tempshare RUNTIME DESTINATION bin)
-if(WIN32)
-    install(FILES packaging/windows/update.ps1 DESTINATION bin)
-endif()
 install(FILES LICENSE README.md DESTINATION share/tempshare)
 install(FILES docs/http-api.md docs/lan-https.md docs/ux-review.md DESTINATION share/tempshare/docs)
 install(FILES "${aino_SOURCE_DIR}/LICENSE" DESTINATION share/tempshare/licenses RENAME aino.txt)

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -240,28 +241,6 @@ void reveal(HWND window) {
     InvalidateRect(window, nullptr, FALSE);
 }
 
-int close_choice(HWND window, bool tray) {
-    const TASKDIALOG_BUTTON choices[] = {{IDYES, L"缩小到托盘"}, {IDNO, L"退出 TempShare"}};
-    TASKDIALOGCONFIG dialog{};
-    dialog.cbSize = sizeof(dialog);
-    dialog.hwndParent = window;
-    dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
-    dialog.dwCommonButtons = TDCBF_CANCEL_BUTTON;
-    dialog.pszWindowTitle = L"TempShare";
-    dialog.pszMainInstruction = L"关闭 TempShare";
-    dialog.pszContent = tray ? L"缩小到托盘后，当前连接、传输和投屏会继续。退出会结束这些任务。"
-                              : L"退出会结束当前连接、传输和投屏。";
-    dialog.pButtons = tray ? choices : choices + 1;
-    dialog.cButtons = tray ? 2 : 1;
-    dialog.nDefaultButton = tray ? IDYES : IDCANCEL;
-    int choice = IDCANCEL;
-    if (SUCCEEDED(TaskDialogIndirect(&dialog, &choice, nullptr, nullptr))) return choice;
-    const int answer = MessageBoxW(window, tray ? L"是：缩小到托盘\n否：退出并结束当前连接\n取消：返回窗口"
-                                               : L"退出 TempShare 并结束当前连接？",
-                                   L"TempShare", (tray ? MB_YESNOCANCEL : MB_YESNO) | MB_ICONQUESTION);
-    return tray ? answer : answer == IDYES ? IDNO : IDCANCEL;
-}
-
 LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
     auto& desktop = *reinterpret_cast<DesktopIntegration*>(ref);
     if (desktop.taskbar_created && msg == desktop.taskbar_created) {
@@ -275,10 +254,10 @@ LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT
     if (msg == WM_CLOSE && !desktop.allow_exit) {
         if (desktop.close_prompt) return 0;
         desktop.close_prompt = true;
-        const auto choice = close_choice(window, desktop.tray);
-        desktop.close_prompt = false;
-        if (choice == IDYES && desktop.tray) desktop.minimize();
-        if (choice != IDNO) return 0;
+        desktop.close_requested = true;
+        InvalidateRect(window, nullptr, FALSE);
+        if (desktop.wake) desktop.wake();
+        return 0;
     }
     if (msg == tray_message) {
         if (lp == NIN_BALLOONUSERCLICK) {
@@ -346,7 +325,8 @@ BOOL CALLBACK find_window(HWND window, LPARAM data) {
 }
 }
 
-DesktopIntegration::DesktopIntegration(std::vector<std::filesystem::path>& paths) {
+DesktopIntegration::DesktopIntegration(std::vector<std::filesystem::path>& paths, std::function<void()> wake_callback)
+    : wake(std::move(wake_callback)) {
     HWND native = nullptr;
     EnumThreadWindows(GetCurrentThreadId(), find_window, reinterpret_cast<LPARAM>(&native));
     if (!native) return;
@@ -389,28 +369,7 @@ bool DesktopIntegration::notify(const std::wstring& title, const std::wstring& m
     return true;
 }
 
-bool DesktopIntegration::updates(bool automatic) const {
-    wchar_t executable[32768]{};
-    const auto count = GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
-    if (!count || count == ARRAYSIZE(executable)) return false;
-    const auto app = std::filesystem::path(executable);
-    const auto script = app.parent_path() / "update.ps1";
-    std::error_code ignored;
-    if (!std::filesystem::is_regular_file(script, ignored)) {
-        return !automatic && open_url("https://github.com/sudoevolve/TempShare/releases");
-    }
-    wchar_t system[32768]{};
-    if (!GetSystemDirectoryW(system, ARRAYSIZE(system))) return false;
-    const auto powershell = std::filesystem::path(system) / "WindowsPowerShell/v1.0/powershell.exe";
-    auto arguments = L"\"" + powershell.wstring() + L"\" -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -WindowStyle Hidden -File \"" +
-        script.wstring() + L"\" -InstalledVersion " TEMPSHARE_WIDE_VERSION + (automatic ? L" -Automatic" : L"");
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    if (!CreateProcessW(powershell.c_str(), arguments.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-                        nullptr, nullptr, &startup, &process)) return false;
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    return true;
+bool DesktopIntegration::updates() const {
+    return open_url("https://github.com/sudoevolve/TempShare/releases/latest");
 }
 #endif

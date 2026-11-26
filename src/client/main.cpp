@@ -852,10 +852,10 @@ int run(const Options& options) {
     std::vector<std::filesystem::path> dropped;
     aino::Window window(config);
     if (!window.ok()) throw std::runtime_error("无法创建 TempShare 窗口");
-#ifdef _WIN32
-    DesktopIntegration desktop(dropped);
-#endif
     const auto repaint = [&window] { window.wake(); };
+#ifdef _WIN32
+    DesktopIntegration desktop(dropped, repaint);
+#endif
     const auto config_path = configuration_directory();
     int appearance = load_appearance(config_path);
     bool system_dark = system_dark_mode().value_or(true);
@@ -864,8 +864,7 @@ int run(const Options& options) {
     const auto inbox = receive_directory(options, config_path);
 #ifdef _WIN32
     desktop.inbox = inbox;
-    const auto automatic_updates = config_path / "github-update.enabled";
-    auto next_update = std::chrono::steady_clock::now();
+    bool close_dialog_open = false;
 #endif
     constexpr std::size_t connection_limit = 4;
     std::array<std::shared_ptr<Connection>, connection_limit> connections;
@@ -910,6 +909,10 @@ int run(const Options& options) {
     try {
         window.run([&](Ui& ui) {
 #ifdef _WIN32
+            if (desktop.close_requested) {
+                desktop.close_requested = false;
+                close_dialog_open = true;
+            }
             if (desktop.clicked_connection >= 0 && desktop.clicked_connection < static_cast<int>(connections.size())) {
                 auto& target = connections[static_cast<std::size_t>(desktop.clicked_connection)];
                 if (target) {
@@ -944,11 +947,6 @@ int run(const Options& options) {
                 view.diagnosis = view.diagnostic_job.get();
             }
 #ifdef _WIN32
-            if (now >= next_update) {
-                next_update = now + std::chrono::hours(1);
-                std::error_code error;
-                if (!config_path.empty() && std::filesystem::is_regular_file(automatic_updates, error)) desktop.updates(true);
-            }
             desktop.inbox = session.notification_state().directory;
             for (std::size_t i = 0; i < connections.size(); ++i) {
                 const auto& item = connections[i];
@@ -1141,11 +1139,48 @@ int run(const Options& options) {
                 if (button(ui, "检查更新", {x + 128, 585, 86, 32}) && !desktop.updates()) {
                     view.status = "无法启动更新检查";
                 }
-                if (button(ui, "缩到托盘", {x + 224, 585, 86, 32})) desktop.minimize();
 #endif
                 break;
             }
             label(ui, view.status, {x, height - 43, content_width, 27}, 12, muted);
+#ifdef _WIN32
+            if (close_dialog_open) {
+                const float dialog_width = std::min(390.0f, width - 40.0f);
+                const Rect dialog{(width - dialog_width) / 2.0f, (height - 194.0f) / 2.0f,
+                                  dialog_width, 194.0f};
+                bool open = true;
+                ui.dialog("关闭 TempShare",
+                          desktop.tray ? "缩小到托盘后，连接和传输会继续运行。直接退出会结束当前会话。"
+                                       : "直接退出会结束当前会话。",
+                          &open, dialog);
+                const float button_y = dialog.bottom() - 46.0f;
+                const float gap = 8.0f;
+                const float button_width = desktop.tray ? (dialog.w - 48.0f - gap * 2.0f) / 3.0f
+                                                        : (dialog.w - 48.0f - gap) / 2.0f;
+                float button_x = dialog.x + 24.0f;
+                if (desktop.tray && button(ui, "缩小到托盘", {button_x, button_y, button_width, 30})) {
+                    desktop.minimize();
+                    close_dialog_open = false;
+                    desktop.close_prompt = false;
+                }
+                if (desktop.tray) button_x += button_width + gap;
+                if (button(ui, "直接退出", {button_x, button_y, button_width, 30}, true)) {
+                    desktop.allow_exit = true;
+                    close_dialog_open = false;
+                    desktop.close_prompt = false;
+                    window.close();
+                }
+                button_x += button_width + gap;
+                if (button(ui, "继续使用", {button_x, button_y, button_width, 30})) {
+                    close_dialog_open = false;
+                    desktop.close_prompt = false;
+                }
+                if (!open) {
+                    close_dialog_open = false;
+                    desktop.close_prompt = false;
+                }
+            }
+#endif
         });
     } catch (...) {
         stop_timer();
