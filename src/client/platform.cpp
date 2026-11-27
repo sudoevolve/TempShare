@@ -213,6 +213,28 @@ std::filesystem::path configuration_directory() {
     return {};
 }
 
+std::filesystem::path downloads_directory() {
+#ifdef _WIN32
+    PWSTR raw = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads, KF_FLAG_DEFAULT, nullptr, &raw)) && raw) {
+        std::filesystem::path result(raw);
+        CoTaskMemFree(raw);
+        return result;
+    }
+#elif defined(__APPLE__)
+    @autoreleasepool {
+        NSArray* paths = NSSearchPathForDirectoriesInDomains(NSDownloadsDirectory, NSUserDomainMask, YES);
+        if (paths.count) return std::filesystem::u8path([[paths firstObject] UTF8String]);
+    }
+#else
+    if (const auto* root = std::getenv("XDG_DOWNLOAD_DIR")) {
+        if (*root) return std::filesystem::u8path(root);
+    }
+    if (const auto* home = std::getenv("HOME")) return std::filesystem::u8path(home) / "Downloads";
+#endif
+    return std::filesystem::current_path() / "Downloads";
+}
+
 #ifdef _WIN32
 namespace {
 constexpr UINT tray_message = WM_APP + 114;

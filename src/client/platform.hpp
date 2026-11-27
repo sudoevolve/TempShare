@@ -12,6 +12,7 @@ bool open_url(const std::string& url);
 bool open_folder(const std::filesystem::path& directory);
 bool reveal_file(const std::filesystem::path& file);
 std::filesystem::path configuration_directory();
+std::filesystem::path downloads_directory();
 std::optional<bool> system_dark_mode();
 
 #ifdef _WIN32

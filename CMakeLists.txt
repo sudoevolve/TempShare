@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TempShare VERSION 0.5.0 LANGUAGES C CXX)
+project(TempShare VERSION 0.5.1 LANGUAGES C CXX)
 
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -135,6 +135,7 @@ endforeach()
 
 install(TARGETS tempshare RUNTIME DESTINATION bin)
 install(FILES LICENSE README.md DESTINATION share/tempshare)
+install(FILES src/web/icon.png DESTINATION share/tempshare)
 install(FILES docs/http-api.md docs/lan-https.md docs/ux-review.md docs/lan-interconnection-review.md
     DESTINATION share/tempshare/docs)
 install(FILES "${aino_SOURCE_DIR}/LICENSE" DESTINATION share/tempshare/licenses RENAME aino.txt)

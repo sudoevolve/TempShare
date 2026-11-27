@@ -539,6 +539,9 @@ void render_remote_files(Ui& ui, tempshare::HttpServer& http, tempshare::Session
     label(ui, "来自 " + remote.device, {x + 16, 158, width - 32, 28}, 16, text, true);
     label(ui, remote.transferring ? "正在传输 " + readable_size(remote.transferred) + " / " + readable_size(remote.total) :
           remote.transfer_status.empty() ? remote.status : remote.transfer_status, {x + 16, 191, width - 32, 24}, 12, muted);
+    if (!remote.transferring && width >= 500 &&
+        button(ui, "打开接收文件夹", {x + 162, 222, 137, 27}) &&
+        !open_folder(session.snapshot(View::Page::home).directory)) view.status = "无法打开接收文件夹";
     if (remote.transferring && button(ui, "取消传输", {x + 16, 222, 88, 27})) http.peer().cancel_transfer();
     if (!remote.transferring && button(ui, "发送文件给对方", {x + 16, 222, 138, 27}, true)) {
         const auto files = pick_paths(view, false);
@@ -599,6 +602,8 @@ void render_received(Ui& ui, aino::Window& window, tempshare::Session& session, 
         label(ui, "暂无接收记录", {x, 109, width, 32}, 14, muted);
         return;
     }
+    if (button(ui, "打开接收文件夹", {x, 103, 130, 29}) && !open_folder(snapshot.directory))
+        view.status = "无法打开接收文件夹";
     if (button(ui, "清理记录", {x + width - 85, 103, 85, 29})) {
         view.status = session.clear_received() ? "接收记录已清理，文件仍保存在接收目录" : "无法保存记录";
     }
@@ -625,7 +630,7 @@ void render_received(Ui& ui, aino::Window& window, tempshare::Session& session, 
             label(ui, summary.str(), {box.x + 14, box.y + 25, box.w - 35, 17}, 12, muted);
             const auto id = std::hash<std::string>{}(file.id);
             if (available && button(ui, "打开", {box.x + 14, box.y + 48, 56, 26}, false, id) &&
-                !open_folder(file.path)) view.status = "无法打开文件";
+                !open_url(file.path.u8string())) view.status = "无法打开文件";
             if (available && button(ui, "定位", {box.x + 78, box.y + 48, 56, 26}, false, id + 1) &&
                 !reveal_file(file.path)) view.status = "无法定位文件";
             if (button(ui, "复制路径", {box.x + 142, box.y + 48, 77, 26}, false, id + 2)) {
@@ -644,10 +649,12 @@ std::filesystem::path receive_directory(const Options& options, const std::files
             value.resize(static_cast<std::size_t>(input.gcount()));
             const auto path = std::filesystem::u8path(value);
             std::error_code error;
+            const auto old_default = config / "received";
+            if (path == old_default) return downloads_directory();
             if (path.is_absolute() && std::filesystem::is_directory(path, error)) return path;
         }
     }
-    return (config.empty() ? std::filesystem::current_path() : config) / "received";
+    return downloads_directory();
 }
 
 bool save_receive_directory(const std::filesystem::path& config, const std::filesystem::path& directory) {
@@ -692,14 +699,14 @@ void render_settings(Ui& ui, View& view, tempshare::Session& session, const temp
         if (!paths.empty()) update_directory(paths.front());
     }
     if (button(ui, "恢复默认", {x + width - 103, 167, 85, 28})) {
-        const auto target = (config.empty() ? std::filesystem::current_path() : config) / "received";
+        const auto target = downloads_directory();
         std::error_code error;
         std::filesystem::create_directories(target, error);
         if (!error) update_directory(target);
         else view.status = "无法创建默认接收目录";
     }
 
-    label(ui, "接收目录为本机全局设置。", {x, 280, width, 24}, 13, muted);
+    label(ui, "首次运行默认保存到系统“下载”目录；改动后会记住你的选择。", {x, 280, width, 24}, 13, muted);
     label(ui, "设备授权请打开侧栏的「设备与权限」。", {x, 304, width, 20}, 12, muted);
 }
 
@@ -980,6 +987,18 @@ int run(const Options& options) {
     DesktopIntegration desktop(dropped, repaint);
 #endif
     const auto config_path = configuration_directory();
+    aino::Image brand_icon;
+    {
+        std::string error;
+        const auto executable = std::filesystem::path(aino::executable_directory());
+        const std::array<std::filesystem::path, 3> candidates{
+            executable / "../share/tempshare/icon.png",
+            executable / "icon.png",
+            std::filesystem::current_path() / "src/web/icon.png"};
+        for (const auto& candidate : candidates) {
+            if (brand_icon.load(candidate.lexically_normal().u8string(), &error)) break;
+        }
+    }
     int appearance = load_appearance(config_path);
     bool system_dark = system_dark_mode().value_or(true);
     auto next_appearance_check = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -1188,8 +1207,11 @@ int run(const Options& options) {
             const float content_width = auto_hide ? width - x - 28 : rail_left - x - 18;
             ui.clear(background);
             ui.fill_rect({0, 0, side_width, height}, sidebar);
-            ui.fill_rect_grad({17, 22, 30, 30}, Color{59, 170, 255}, Color{104, 65, 236}, 9);
-            ui.draw_text("ϟ", {17, 22, 30, 30}, white, Style().font(21).bold().center());
+            if (brand_icon.valid()) ui.draw_image(brand_icon, {17, 22, 30, 30});
+            else {
+                ui.fill_rect_grad({17, 22, 30, 30}, Color{59, 170, 255}, Color{104, 65, 236}, 9);
+                ui.draw_text("ϟ", {17, 22, 30, 30}, white, Style().font(21).bold().center());
+            }
             label(ui, "TempShare", {56, 20, 104, 34}, 16, text, true);
             if (view.previous_invitation != snapshot.invitation) {
                 view.previous_invitation = snapshot.invitation;
