@@ -1037,7 +1037,7 @@ int run(const Options& options) {
             connections[static_cast<std::size_t>(selected_connection)]->view.status = "当前设备已满，请先离开一个连接";
         } else if (connections[slot]->http.peer().join(address)) {
             selected_connection = static_cast<int>(slot);
-            connections[slot]->view.page = View::Page::cast;
+            connections[slot]->view.page = View::Page::home;
             connections[slot]->view.connection_open = true;
         } else connections[slot]->view.status = "请输入局域网地址或完整邀请链接；HTTPS需要启用TLS的构建";
         window.wake();

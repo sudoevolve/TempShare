@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TempShare VERSION 0.4.0 LANGUAGES C CXX)
+project(TempShare VERSION 0.4.1 LANGUAGES C CXX)
 
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
