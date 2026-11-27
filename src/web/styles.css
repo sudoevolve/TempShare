@@ -122,6 +122,7 @@ button:disabled { opacity: .56; cursor: default; }
 .connection::before { width: 7px; height: 7px; border-radius: 50%; background: currentColor; content: ""; }
 .connection[data-state="approved"] { color: var(--green); }
 .connection[data-state="pending"]::before { background: #efab4f; }
+.transport-warning { max-width: 520px; margin: 8px auto 0; color: var(--muted); font-size: 12px; line-height: 1.45; text-align: center; }
 
 .hero {
   width: min(100%, 390px);

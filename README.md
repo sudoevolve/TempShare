@@ -59,6 +59,16 @@ ctest --test-dir build --output-on-failure
 
 当前已在 Windows 和 Linux 构建验证。macOS 是目标平台，尚待实机验证。
 
+本地进行内存和未定义行为检查时，可在 Linux/macOS 配置 Sanitizer 构建（需要 Clang 或 GCC 的运行时支持）：
+
+```sh
+cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug -DTEMPSHARE_SANITIZERS=ON
+cmake --build build-sanitize --parallel
+ctest --test-dir build-sanitize --output-on-failure
+```
+
+该选项用于开发检查，不进入发布包；Windows MSVC 构建继续使用默认运行时配置。
+
 ## 使用
 
 桌面侧栏底部和网页右上角可以选择跟随系统、浅色或深色。桌面端和各浏览器分别保存外观偏好。

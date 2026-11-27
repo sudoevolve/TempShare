@@ -335,7 +335,9 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
             } else {
                 const bool connected = peer.attached ? peer.online : pairing.online;
                 label(ui, connected ? "在线 · 已配对" : "已配对 · 等待恢复", {qr_left + 18, top + 97, 220, 24}, 13, connected ? online : muted, true);
-                label(ui, peer.attached ? "桌面互联 · 可双向投屏" : "浏览器连接", {qr_left + 18, top + 121, 220, 21}, 12, muted);
+                label(ui, peer.attached ? std::string("桌面互联 · ") + (server.secure() ? "HTTPS" : "局域网 HTTP")
+                                        : std::string("浏览器连接 · ") + (server.secure() ? "HTTPS" : "局域网 HTTP"),
+                      {qr_left + 18, top + 121, 220, 21}, 12, muted);
                 const auto waiting = std::count_if(snapshot.offers.begin(), snapshot.offers.end(),
                     [](const tempshare::Offer& offer) { return offer.state == State::pending; });
                 if (waiting && button(ui, std::to_string(waiting) + " 个文件待接收",
@@ -374,7 +376,8 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                 }
                 const auto adapter = current->interface_name.empty() ? (current->wireless ? "Wi-Fi" : "局域网")
                                                                     : current->interface_name;
-                ui.draw_text(adapter, {qr_left + 18, top + 232, 220, 19}, muted, Style().center().font(11));
+                ui.draw_text(adapter + (server.secure() ? " · HTTPS" : " · 局域网 HTTP"),
+                             {qr_left + 18, top + 232, 220, 19}, muted, Style().center().font(11));
                 label(ui, "连接码 " + snapshot.code, {qr_left + 18, top + 263, 114, 28}, 13, text, true);
                 if (button(ui, "复制邀请链接", {qr_left + 140, top + 263, 98, 28})) {
                     view.status = window.try_set_clipboard(invitation) ? "邀请链接已复制" : "无法写入剪贴板";

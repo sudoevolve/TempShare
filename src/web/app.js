@@ -72,6 +72,11 @@ let shownRecovery = '';
 const trustedConnect = byId('trusted-connect');
 trustedConnect.hidden = location.protocol !== 'https:';
 byId('resume-option').hidden = location.protocol !== 'https:' || !crypto.subtle;
+const transportWarning = byId('transport-warning');
+if (location.protocol === 'http:' && !['127.0.0.1', 'localhost', '::1', '[::1]'].includes(location.hostname)) {
+  transportWarning.textContent = '当前使用局域网 HTTP；同一网络中的设备可能观察到连接内容。';
+  transportWarning.hidden = false;
+}
 
 function message(text, error = false) {
   const notice = byId('message');

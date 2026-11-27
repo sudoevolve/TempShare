@@ -654,9 +654,11 @@ HttpServer::HttpServer(Session& session, const std::string& certificate, const s
     }
     auto& server = *server_;
     peer_ = std::make_unique<PeerLink>(session, std::move(changed));
-    server.new_task_queue = [] { return new httplib::ThreadPool(8, 8, 32); };
+    // Four transfer slots are reserved by register_transfers. Keep additional workers
+    // available for pairing, status, approval and cast control requests.
+    server.new_task_queue = [] { return new httplib::ThreadPool(12, 12, 48); };
     server.set_payload_max_length(max_file_size);
-    server.set_keep_alive_max_count(1);
+    server.set_keep_alive_max_count(4);
     server.set_read_timeout(10);
     server.set_write_timeout(10);
     server.set_default_headers({

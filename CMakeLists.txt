@@ -8,6 +8,7 @@ include(FetchContent)
 include(CTest)
 find_package(Threads REQUIRED)
 option(TEMPSHARE_TLS "Enable HTTPS with OpenSSL and a user-provided certificate" OFF)
+option(TEMPSHARE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer for local checks" OFF)
 
 FetchContent_Declare(aino
     GIT_REPOSITORY https://github.com/sudoevolve/aino.git
@@ -132,6 +133,13 @@ foreach(target IN ITEMS tempshare tempshare_core)
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endforeach()
+
+if(TEMPSHARE_SANITIZERS AND NOT MSVC)
+    target_compile_options(tempshare PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_compile_options(tempshare_core PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(tempshare PRIVATE -fsanitize=address,undefined)
+    target_link_options(tempshare_core PRIVATE -fsanitize=address,undefined)
+endif()
 
 install(TARGETS tempshare RUNTIME DESTINATION bin)
 install(FILES LICENSE README.md DESTINATION share/tempshare)

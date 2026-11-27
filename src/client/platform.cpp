@@ -110,9 +110,12 @@ std::vector<std::filesystem::path> choose_paths(bool directory, bool* failed) {
         }
     }
 #else
+    // Use an ASCII record separator rather than '|': '|' is a valid Linux filename
+    // character and must not split a multi-selection result.
+    constexpr char selection_separator = '\x1f';
     const char* command = directory ?
         "zenity --file-selection --directory 2>/dev/null" :
-        "zenity --file-selection --multiple --separator='|' 2>/dev/null";
+        "zenity --file-selection --multiple --separator=\"$(printf '\\037')\" 2>/dev/null";
     if (auto* pipe = popen(command, "r")) {
         char buffer[4096];
         std::string result;
@@ -124,7 +127,7 @@ std::vector<std::filesystem::path> choose_paths(bool directory, bool* failed) {
         }
         if (status || result.empty()) return paths;
         if (result.back() == '\n') result.pop_back();
-        const char separator = directory ? '\0' : '|';
+        const char separator = directory ? '\0' : selection_separator;
         std::size_t start = 0;
         while (start < result.size()) {
             const auto end = result.find(separator, start);

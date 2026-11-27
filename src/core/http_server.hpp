@@ -25,6 +25,7 @@ public:
     bool start(unsigned short preferred_port, bool loopback = false);
     void stop();
     unsigned short port() const { return port_; }
+    bool secure() const { return secure_; }
     std::string url(const std::string& address) const;
     bool probe(const std::string& address) const;
     std::vector<LocalNetwork> networks() const;
