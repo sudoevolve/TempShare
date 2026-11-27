@@ -21,6 +21,7 @@
     <div class="share-heading">
       <h1>屏幕投递</h1>
       <p>选择要共享的屏幕、窗口或标签页。已配对设备可以在屏幕投递页观看。</p>
+      <p id="target" role="status"></p>
     </div>
     <video id="preview" class="cast-video" muted autoplay playsinline hidden></video>
     <div class="cast-options">
@@ -53,6 +54,7 @@
     </div>
     <p id="status" class="message" role="status"></p>
     <p id="capture-info" class="message"></p>
+    <p id="transport-info" class="message" aria-live="polite"></p>
     <p id="audio-info" class="message"></p>
   </main>
 </body>

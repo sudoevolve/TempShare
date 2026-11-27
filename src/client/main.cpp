@@ -2,6 +2,7 @@
 #include "core/folder_archive.hpp"
 #include "core/http_server.hpp"
 #include "core/session.hpp"
+#include "core/peer_link.hpp"
 #include "platform.hpp"
 
 #define AINO_IMPLEMENTATION
@@ -105,10 +106,11 @@ void label(Ui& ui, const std::string& value, Rect rect, float size = 14,
     ui.draw_text(value, rect, color, style);
 }
 
-bool button(Ui& ui, const std::string& value, Rect rect, bool primary = false, std::uint64_t id = 0) {
+bool button(Ui& ui, const std::string& value, Rect rect, bool primary = false, std::uint64_t id = 0, bool enabled = true) {
     auto style = Style().font(13).corner(8).id(id);
     if (primary) style.primary();
     else style.secondary();
+    if (!enabled) style.off();
     return ui.button(value, rect, style);
 }
 
@@ -119,6 +121,20 @@ std::string readable_size(std::uint64_t size) {
     output << std::fixed << std::setprecision(1);
     if (size < mib) output << size / 1024.0 << " KiB";
     else output << size / mib << " MiB";
+    return output.str();
+}
+
+std::string readable_time(std::uint64_t timestamp) {
+    if (!timestamp || timestamp > 32535215999ULL) return "时间未知";
+    const auto value = static_cast<std::time_t>(timestamp);
+    std::tm local{};
+#ifdef _WIN32
+    if (localtime_s(&local, &value) != 0) return "时间未知";
+#else
+    if (!localtime_r(&value, &local)) return "时间未知";
+#endif
+    std::ostringstream output;
+    output << std::put_time(&local, "%m-%d %H:%M");
     return output.str();
 }
 
@@ -171,12 +187,26 @@ struct View {
     std::future<std::string> diagnostic_job;
     std::filesystem::path space_directory;
     std::string space_status;
+    std::string message_search;
+    std::optional<tempshare::Message> message_detail;
+    bool confirm_clear = false;
+    bool confirm_leave = false;
+    bool remote_files = false;
+    std::string detail_text;
+    std::string device_name;
+    std::vector<std::filesystem::path> failed_files;
+    std::vector<std::string> batch_ids;
+    bool batch_open = false;
+    bool batch_accept = true;
+    bool downloads_open = false;
+    std::optional<tempshare::Permissions> permissions_pending;
+    std::string file_failures;
 };
 
 std::vector<std::filesystem::path> pick_paths(View& view, bool directory) {
     bool failed = false;
     auto paths = choose_paths(directory, &failed);
-    if (failed) view.status = "无法打开文件选择器，可在设置中输入路径";
+    if (failed) view.status = "无法打开文件选择器，可在文件页输入共享路径，或在设置中输入接收目录";
     return paths;
 }
 
@@ -195,8 +225,15 @@ std::size_t page_controls(Ui& ui, std::size_t& page, std::size_t total, std::siz
 void share_paths(tempshare::Session& session, View& view, const std::vector<std::filesystem::path>& paths, bool image = false) {
     if (paths.empty()) return;
     std::size_t added = 0;
+    view.failed_files.clear(); view.file_failures.clear();
     for (const auto& path : paths) {
         if (session.share(std::filesystem::absolute(path), image)) ++added;
+        else {
+            view.failed_files.push_back(path);
+            std::error_code error;
+            const auto size = std::filesystem::file_size(path, error);
+            view.file_failures += path.u8string() + " · " + (error ? "无法读取或不是文件" : size > tempshare::max_file_size ? "超过1GiB" : "会话已结束或共享清单已满") + "\n";
+        }
     }
     view.status = "已添加 " + std::to_string(added) + " 个文件";
     if (added < paths.size()) view.status += "，部分文件无法读取、超过 1 GiB 或列表已满";
@@ -263,6 +300,7 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                        const tempshare::Snapshot& snapshot, const std::vector<tempshare::LocalNetwork>& networks,
                        View& view, float qr_left, float top) {
     card(ui, {qr_left, top, 256, 342});
+    const auto peer = server.peer().snapshot();
     label(ui, snapshot.pairing ? "连接设备" : "扫码连接", {qr_left + 18, top + 12, 220, 26}, 16, text, true);
     if (snapshot.active) {
         const auto selected = std::find_if(networks.begin(), networks.end(), [&](const tempshare::LocalNetwork& network) {
@@ -278,18 +316,32 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
         }
         if (snapshot.pairing) {
             const auto& pairing = *snapshot.pairing;
-            label(ui, pairing.name, {qr_left + 18, top + 61, 220, 32}, 17, text, true);
+            label(ui, peer.attached ? peer.device : pairing.name, {qr_left + 18, top + 61, 220, 32}, 17, text, true);
             if (pairing.state == State::pending) {
-                label(ui, "核对浏览器验证码 · " + std::to_string(pairing.remaining_seconds) + " 秒",
+                label(ui, std::string(peer.outgoing ? "等待对方确认 · " : "核对双方验证码 · ") + std::to_string(pairing.remaining_seconds) + " 秒",
                       {qr_left + 18, top + 99, 220, 24}, 12, muted);
-                label(ui, pairing.verification, {qr_left + 18, top + 130, 220, 42}, 27, online, true);
-                if (button(ui, "允许连接", {qr_left + 18, top + 184, 104, 34}, true)) {
+                label(ui, peer.outgoing ? peer.verification : pairing.verification, {qr_left + 18, top + 130, 220, 42}, 27, online, true);
+                auto permissions = snapshot.permissions;
+                if (!peer.outgoing) {
+                    ui.checkbox(&permissions.download, "浏览下载", {qr_left + 18, top + 178, 104, 24});
+                    ui.checkbox(&permissions.upload, "申请发送", {qr_left + 134, top + 178, 104, 24});
+                    ui.checkbox(&permissions.text, "文本图片", {qr_left + 18, top + 207, 104, 24});
+                    ui.checkbox(&permissions.cast, "屏幕观看", {qr_left + 134, top + 207, 104, 24});
+                    if (permissions.download != snapshot.permissions.download || permissions.upload != snapshot.permissions.upload ||
+                        permissions.text != snapshot.permissions.text || permissions.cast != snapshot.permissions.cast)
+                        session.set_permissions(permissions);
+                }
+                if (!peer.outgoing && button(ui, "允许连接", {qr_left + 18, top + 252, 104, 34}, true)) {
                     session.decide_pairing(pairing.token, true);
                 }
-                if (button(ui, "拒绝", {qr_left + 134, top + 184, 104, 34})) session.decide_pairing(pairing.token, false);
+                if (button(ui, peer.outgoing ? "取消请求" : "拒绝", {qr_left + 134, top + 252, 104, 34})) {
+                    if (peer.outgoing) session.disconnect(pairing.token);
+                    else session.decide_pairing(pairing.token, false);
+                }
             } else {
-                label(ui, "已连接", {qr_left + 18, top + 97, 220, 24}, 13, online, true);
-                if (!networks.empty()) label(ui, url, {qr_left + 18, top + 117, 220, 21}, 12, muted);
+                const bool connected = peer.attached ? peer.online : pairing.online;
+                label(ui, connected ? "在线 · 已配对" : "已配对 · 等待恢复", {qr_left + 18, top + 97, 220, 24}, 13, connected ? online : muted, true);
+                label(ui, peer.attached ? "桌面互联 · 可双向投屏" : "浏览器连接", {qr_left + 18, top + 121, 220, 21}, 12, muted);
                 const auto waiting = std::count_if(snapshot.offers.begin(), snapshot.offers.end(),
                     [](const tempshare::Offer& offer) { return offer.state == State::pending; });
                 if (waiting && button(ui, std::to_string(waiting) + " 个文件待接收",
@@ -302,7 +354,7 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                     label(ui, "正在共享屏幕", {qr_left + 18, top + 187, 220, 27}, 13, online);
                     if (button(ui, "停止共享", {qr_left + 18, top + 219, 220, 33})) session.stop_cast();
                 }
-                if (button(ui, "会话权限", {qr_left + 18, top + 262, 103, 28})) view.page = View::Page::settings;
+                if (button(ui, "离开设备", {qr_left + 18, top + 262, 103, 28})) view.confirm_leave = true;
                 if (button(ui, snapshot.trust_enabled ? "设备信任" : "信任设置", {qr_left + 134, top + 262, 104, 28})) {
                     view.page = View::Page::devices;
                 }
@@ -319,7 +371,8 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                     std::vector<std::string> choices;
                     for (const auto& network : networks) choices.push_back(server.url(network.address));
                     int index = static_cast<int>(std::distance(networks.begin(), current));
-                    if (ui.select(choices, &index, {qr_left + 18, top + 202, 220, 30}, Style().font(13))) {
+                    if (ui.menu(choices[static_cast<std::size_t>(index)], choices, &index,
+                                {qr_left + 18, top + 202, 220, 30}, Style().font(13))) {
                         view.selected_address = networks[static_cast<std::size_t>(index)].address;
                         window.wake();
                     }
@@ -349,7 +402,7 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                 if (session.extend()) view.status = "已从现在起延长会话 30 分钟";
             }
             if (button(ui, "结束会话", {qr_left + 132, top + 301, 106, 28})) {
-                if (active_requests || snapshot.capture_ready) {
+                if (active_requests || snapshot.capture_ready || snapshot.pairing || !snapshot.messages.empty()) {
                     view.confirm_end = true;
                     view.status = "结束会话将停止投屏或取消 " + std::to_string(active_requests) + " 个接收请求";
                 } else {
@@ -369,29 +422,31 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
 
 void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
                   const tempshare::Snapshot& snapshot, View& view, float x, float transfer_width, float bottom) {
-    card(ui, {x, 106, transfer_width, 120});
-    label(ui, "分享文件或文件夹", {x + 18, 119, transfer_width - 36, 30}, 16, text, true);
+    card(ui, {x, 142, transfer_width, 156});
+    label(ui, "共享下载清单（对方选择保存）", {x + 18, 155, transfer_width - 36, 30}, 16, text, true);
 #ifdef _WIN32
-    label(ui, "拖入文件，或选择要分享的文件", {x + 18, 151, transfer_width - 36, 25}, 13, muted);
+    label(ui, "拖入文件，或选择要分享的文件", {x + 18, 187, transfer_width - 36, 25}, 13, muted);
 #else
-    label(ui, "选择文件，或在设置中输入文件路径", {x + 18, 151, transfer_width - 36, 25}, 13, muted);
+    label(ui, "选择文件或在下方输入文件路径", {x + 18, 187, transfer_width - 36, 25}, 13, muted);
 #endif
-    if (snapshot.active && button(ui, "选择文件", {x + 18, 181, 92, 32}, true)) {
+    if (button(ui, snapshot.active ? "选择文件" : "新建会话", {x + 18, 217, 92, 32}, true)) {
+        if (!snapshot.active) { session.start(); return; }
         share_paths(session, view, pick_paths(view, false));
     }
-    if (snapshot.active && !view.folder_job.valid()) {
-        if (button(ui, "分享文件夹", {x + 119, 181, 101, 32})) share_folder(session, window, view, snapshot, false);
-        if (button(ui, "打包 ZIP", {x + 229, 181, 86, 32})) share_folder(session, window, view, snapshot, true);
+    if (!view.folder_job.valid()) {
+        if (button(ui, "分享文件夹", {x + 119, 217, 101, 32}, false, 0, snapshot.active)) share_folder(session, window, view, snapshot, false);
+        if (button(ui, "打包 ZIP", {x + 229, 217, 86, 32}, false, 0, snapshot.active)) share_folder(session, window, view, snapshot, true);
     } else if (view.folder_job.valid()) {
-        if (button(ui, "取消目录任务", {x + 119, 181, 135, 32})) *view.folder_cancel = true;
+        if (button(ui, "取消目录任务", {x + 119, 217, 135, 32})) *view.folder_cancel = true;
         const auto scanned = view.folder_scanned->load();
         if (scanned && transfer_width > 355) {
-            label(ui, "已读取 " + std::to_string(scanned) + " 项", {x + 262, 181, transfer_width - 275, 32}, 12, muted);
+            label(ui, "已读取 " + std::to_string(scanned) + " 项", {x + 262, 217, transfer_width - 275, 32}, 12, muted);
         }
-    } else if (button(ui, "新建会话", {x + 119, 181, 101, 32})) {
-        session.start();
     }
-    constexpr float list_y = 245.0f;
+    ui.input(&view.path, {x + 18, 261, transfer_width - 129, 27}, Style().hint("或粘贴文件/文件夹路径"));
+    if (button(ui, "添加共享", {x + transfer_width - 103, 261, 85, 27}) && !view.path.empty())
+        share_selection(session, view, {std::filesystem::u8path(view.path)});
+    constexpr float list_y = 315.0f;
     label(ui, "接收请求", {x, list_y, 104, 26}, 16, text, true);
     std::vector<const tempshare::Offer*> pending;
     for (const auto& offer : snapshot.offers) {
@@ -417,12 +472,10 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
     }
     if (visible.size() > 1 && button(ui, "接收 " + std::to_string(visible.size()) + " 个",
                                      {x + 104, list_y, 92, 28}, true)) {
-        const auto count = session.decide_offers(visible, true);
-        view.status = "已接受 " + std::to_string(count) + " 个文件";
-        if (count < visible.size()) view.status += "，部分请求已变化或超出会话接收上限";
+        view.batch_ids = visible; view.batch_accept = true; view.batch_open = true;
     }
     if (visible.size() > 1 && transfer_width >= 405 && button(ui, "拒绝这批", {x + 200, list_y, 73, 28})) {
-        session.decide_offers(visible, false);
+        view.batch_ids = visible; view.batch_accept = false; view.batch_open = true;
     }
     if (visible.size() > 1 && transfer_width >= 400) {
         label(ui, readable_size(visible_bytes), {x + 280, list_y, 68, 24}, 12, muted);
@@ -448,7 +501,9 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
                     session.decide_offer(offer.id, false);
                 }
             } else if (offer.state == State::approved) {
-                label(ui, "等待上传", {x + transfer_width - 77, row + 7, 66, 28}, 12, online);
+                if (button(ui, "取消", {x + transfer_width - 64, row + 7, 52, 28}, false, id + 2)) session.cancel_offer(offer.id);
+            } else if (offer.state == State::uploading) {
+                if (button(ui, "取消", {x + transfer_width - 64, row + 7, 52, 28}, false, id + 2)) session.cancel_offer(offer.id);
             }
         }
     }
@@ -464,9 +519,15 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
             card(ui, {box.x, box.y, box.w - 10, 38});
             if (file.folder) ui.system_icon(SystemIcon::Folder, {box.x + 12, box.y + 9, 20, 20}, accent);
             const float name_inset = file.folder ? 40.0f : 12.0f;
-            const float actions = file.folder ? 137.0f : 80.0f;
+            const float actions = 137.0f;
+            const bool available = file.folder || tempshare::SharedSource(file.path).version() == file.source;
             label(ui, file.name + "  ·  " + (file.folder ? "可浏览的文件夹" : readable_size(file.size)),
-                  {box.x + name_inset, box.y + 2, box.w - actions - name_inset, 34}, 13);
+                  {box.x + name_inset, box.y + 2, box.w - actions - name_inset, 34}, 13, available ? text : Color{235, 100, 100});
+            if (!file.folder && button(ui, available ? "重发" : "刷新", {box.x + box.w - 128, box.y + 5, 50, 28}, false,
+                                      std::hash<std::string>{}("reload" + file.id))) {
+                if (session.share(file.path)) { session.unshare(file.id); view.status = "文件已重新发布，旧链接已失效"; }
+                else view.status = "文件不可读取或超过限制";
+            }
             if (file.folder && !view.folder_job.valid() && button(ui, "刷新", {box.x + box.w - 128, box.y + 5, 50, 28},
                        false, std::hash<std::string>{}("refresh" + file.id))) {
                 share_folder(session, window, view, snapshot, false, file.path, file.id);
@@ -476,37 +537,70 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
         });
 }
 
-void render_nearby(Ui& ui, View& view, tempshare::Discovery& discovery, bool nearby_available, float x, float width) {
-    const auto peers = discovery.peers();
-    ui.input(&view.nearby_address, {x, 106, width - 94, 31}, Style().hint("局域网地址，如 192.168.1.6:8787"));
-    if (button(ui, "打开地址", {x + width - 85, 106, 85, 31})) {
-        auto url = view.nearby_address;
-        if (url.find("://") == std::string::npos) url = "http://" + url;
-        const auto start = url.find("://") + 3;
-        const auto end = url.find_first_of(":/", start);
-        const bool http = url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0;
-        if (!http || !tempshare::is_private_ipv4(url.substr(start, end - start)) ||
-            url.find_first_of("@\\?# \r\n\t") != std::string::npos || !open_url(url)) {
-            view.status = "请输入桌面端显示的局域网 IPv4 地址与端口";
-        }
+void render_remote_files(Ui& ui, tempshare::HttpServer& http, tempshare::Session& session,
+                         View& view, float x, float width, float bottom) {
+    const auto remote = http.peer().snapshot();
+    card(ui, {x, 148, width, 110});
+    label(ui, "来自 " + remote.device, {x + 16, 158, width - 32, 28}, 16, text, true);
+    label(ui, remote.transferring ? "正在传输 " + readable_size(remote.transferred) + " / " + readable_size(remote.total) :
+          remote.transfer_status.empty() ? remote.status : remote.transfer_status, {x + 16, 191, width - 32, 24}, 12, muted);
+    if (remote.transferring && button(ui, "取消传输", {x + 16, 222, 88, 27})) http.peer().cancel_transfer();
+    if (!remote.transferring && button(ui, "发送文件给对方", {x + 16, 222, 138, 27}, true)) {
+        const auto files = pick_paths(view, false);
+        if (!files.empty() && !http.peer().send(files)) view.status = "无法发送，请检查连接、上传权限和单文件1GiB限制";
     }
+    if (button(ui, "浏览对方文件夹", {x + width - 161, 222, 145, 27})) {
+        if (!open_url(http.url("127.0.0.1") + "peer#" + http.peer().browser_key() + ":share"))
+            view.status = "无法打开文件浏览器";
+    }
+    if (remote.files.empty()) { label(ui, "对方尚未共享文件，或下载权限已关闭", {x, 282, width, 30}, 13, muted); return; }
+    ui.scroll({x, 278, width, std::max(50.0f, bottom - 278)}, static_cast<int>(remote.files.size()), 60,
+        [&](int index, const Rect& box) {
+            const auto& file = remote.files[static_cast<std::size_t>(index)];
+            card(ui, {box.x, box.y, box.w - 10, 54});
+            label(ui, file.name, {box.x + 12, box.y + 3, box.w - 118, 25}, 14, text, true);
+            label(ui, file.folder ? "可浏览的文件夹" : readable_size(file.size),
+                  {box.x + 12, box.y + 29, box.w - 118, 19}, 12, muted);
+            if (!file.folder && button(ui, "保存", {box.x + box.w - 88, box.y + 12, 65, 30}, false,
+                                      std::hash<std::string>{}(file.id))) {
+                if (!http.peer().download(file)) view.status = "当前有下载任务，或连接/下载权限不可用";
+                else view.status = "正在保存到 " + session.snapshot(View::Page::home).directory.u8string();
+            }
+        });
+}
+
+
+void render_nearby(Ui& ui, View& view, tempshare::Discovery& discovery, bool nearby_available, float x, float width,
+                   const std::function<void(const std::string&)>& join) {
+    const auto peers = discovery.peers();
+    ui.input(&view.nearby_address, {x, 106, width - 94, 31}, Style().hint("粘贴局域网地址、主机名或完整邀请链接"));
+    if (button(ui, "连接设备", {x + width - 85, 106, 85, 31})) join(view.nearby_address);
     const auto first = page_controls(ui, view.peer_page, peers.size(), 6, x, 146, width);
     if (button(ui, "刷新", {x, 151, 62, 26})) {
         discovery.refresh();
         view.status = nearby_available ? "已重新发送局域网发现请求" : "没有可用的局域网地址";
     }
-    if (peers.empty()) label(ui, nearby_available ? "目前没有发现其他 TempShare 设备" : "未连接可用的局域网",
+    if (peers.empty()) label(ui, discovery.status(),
                             {x + 73, 149, width - 75, 32}, 13, muted);
     float y = 183;
     for (auto i = first; i < std::min(first + 6, peers.size()); ++i, y += 56) {
         const auto& peer = peers[i];
         card(ui, {x, y, width, 50});
         label(ui, peer.name, {x + 14, y + 3, width - 120, 24}, 15, text, true);
-        label(ui, peer.platform + "  ·  " + peer.address, {x + 14, y + 26, width - 120, 17}, 12, muted);
-        if (button(ui, "连接", {x + width - 85, y + 9, 70, 32}, false,
-                   std::hash<std::string>{}(peer.url()))) {
-            if (!open_url(peer.url())) view.status = "无法打开浏览器，请手动输入设备地址";
-        }
+        label(ui, peer.platform + " · " + peer.address + (peer.id.empty() ? "" : " · " + peer.id.substr(0, 6)),
+              {x + 14, y + 26, width - 120, 17}, 12, muted);
+        ui.tooltip({x + 14, y + 3, width - 120, 42}, peer.name + "\n" + peer.url() +
+                   (peer.id.empty() ? "" : "\n设备标识 " + peer.id));
+        const Rect action{x + width - 85, y + 9, 70, 32};
+        if (peer.addresses.size() > 1) {
+            int selected_address = 0;
+            if (ui.menu("连接", peer.addresses, &selected_address, action,
+                        Style().secondary().font(12).id(std::hash<std::string>{}(peer.url())))) {
+                auto target = peer;
+                target.address = peer.addresses[static_cast<std::size_t>(selected_address)];
+                join(target.url());
+            }
+        } else if (button(ui, "连接", action, false, std::hash<std::string>{}(peer.url()))) join(peer.url());
     }
 }
 
@@ -616,22 +710,8 @@ void render_settings(Ui& ui, View& view, tempshare::Session& session, const temp
         else view.status = "无法创建默认接收目录";
     }
 
-    card(ui, {x, 274, width, 122});
-    label(ui, "通过路径添加共享", {x + 18, 287, width - 36, 28}, 16, text, true);
-    ui.input(&view.path, {x + 18, 340, width - 132, 32}, Style().hint("输入文件或文件夹路径"));
-    if (snapshot.active && button(ui, "添加", {x + width - 103, 340, 85, 32}, true) && !view.path.empty()) {
-        share_selection(session, view, {std::filesystem::u8path(view.path)});
-    }
-    if (snapshot.active) {
-        card(ui, {x, 414, width, 154});
-        label(ui, "当前会话权限", {x + 18, 427, width - 36, 28}, 16, text, true);
-        auto permissions = snapshot.permissions;
-        ui.checkbox(&permissions.download, "允许对方下载共享文件", {x + 18, 465, width - 36, 25});
-        ui.checkbox(&permissions.upload, "允许对方申请发送文件", {x + 18, 495, width - 36, 25});
-        ui.checkbox(&permissions.text, "允许双向发送文本", {x + 18, 525, width - 36, 25});
-        if (permissions.download != snapshot.permissions.download || permissions.upload != snapshot.permissions.upload ||
-            permissions.text != snapshot.permissions.text) session.set_permissions(permissions);
-    }
+    label(ui, "此页为本机全局设置，保存接收目录会同步到全部会话。", {x, 280, width, 30}, 13, muted);
+    label(ui, "设备授权请打开侧栏的「设备与权限」。", {x, 319, width, 28}, 13, muted);
 }
 
 bool paired(const tempshare::Snapshot& snapshot) {
@@ -640,35 +720,49 @@ bool paired(const tempshare::Snapshot& snapshot) {
 
 void render_devices(Ui& ui, tempshare::Session& session, const tempshare::Snapshot& snapshot,
                     View& view, float x, float width) {
-    card(ui, {x, 106, width, 104});
+    card(ui, {x, 106, width, 185});
+    label(ui, "当前设备权限（不影响其他设备）", {x + 18, 119, width - 36, 28}, 16, text, true);
+    auto permissions = snapshot.permissions;
+    ui.checkbox(&permissions.download, "允许对方下载共享文件", {x + 18, 155, width - 36, 25});
+    ui.checkbox(&permissions.upload, "允许对方申请发送文件", {x + 18, 185, width - 36, 25});
+    ui.checkbox(&permissions.text, "允许文本和图片（关闭后保留已有记录）", {x + 18, 215, width - 36, 25});
+    ui.checkbox(&permissions.cast, "允许共享与观看屏幕", {x + 18, 245, width - 36, 25});
+    if (permissions.download != snapshot.permissions.download || permissions.upload != snapshot.permissions.upload ||
+        permissions.text != snapshot.permissions.text || permissions.cast != snapshot.permissions.cast) {
+        if ((!permissions.upload && snapshot.permissions.upload && snapshot.pending_transfers) ||
+            (!permissions.cast && snapshot.permissions.cast && snapshot.casting)) view.permissions_pending = permissions;
+        else session.set_permissions(permissions);
+    }
+    card(ui, {x, 306, width, 104});
     if (!snapshot.trust_enabled) {
         label(ui, "持久信任需要配置 HTTPS 和可写的本机配置目录。",
-              {x + 18, 123, width - 36, 30}, 14, muted);
+              {x + 18, 323, width - 36, 55}, 14, muted);
         return;
     }
     if (paired(snapshot)) {
-        label(ui, "当前设备 · " + snapshot.pairing->name, {x + 18, 116, width - 36, 32}, 16, text, true);
+        label(ui, "当前设备 · " + snapshot.pairing->name, {x + 18, 316, width - 36, 32}, 16, text, true);
         const bool known = !snapshot.pairing->trusted_key.empty();
-        if (button(ui, known ? "更新信任权限" : "记住此设备", {x + 18, 158, 121, 34}, true)) {
+        if (button(ui, known ? "更新信任权限" : "记住此设备", {x + 18, 358, 121, 34}, true)) {
             view.status = session.remember_device() ? "已保存设备和当前会话权限" : "无法保存设备信任";
         }
-        label(ui, "保存设置页中的当前权限", {x + 154, 160, width - 172, 28}, 12, muted);
+        label(ui, "保存上方当前授权", {x + 154, 360, width - 172, 28}, 12, muted);
     } else {
         label(ui, "配对设备后，可在这里主动保存信任和授权范围。",
-              {x + 18, 123, width - 36, 30}, 14, muted);
+              {x + 18, 323, width - 36, 30}, 14, muted);
     }
-    label(ui, "已记住的设备", {x, 223, width, 30}, 16, text, true);
-    const auto first = page_controls(ui, view.device_page, snapshot.trusted.size(), 6, x, 253, width);
-    float y = 291;
-    for (auto i = first; i < std::min(first + 6, snapshot.trusted.size()); ++i, y += 54) {
+    label(ui, "已记住的设备", {x, 423, width, 30}, 16, text, true);
+    const auto first = page_controls(ui, view.device_page, snapshot.trusted.size(), 2, x, 453, width);
+    float y = 491;
+    for (auto i = first; i < std::min(first + 2, snapshot.trusted.size()); ++i, y += 54) {
         const auto& device = snapshot.trusted[i];
         card(ui, {x, y, width, 48});
         label(ui, device.name, {x + 14, y + 3, width - 126, 23}, 14, text, true);
-        std::string permissions;
-        if (device.permissions.download) permissions += "下载  ";
-        if (device.permissions.upload) permissions += "申请上传  ";
-        if (device.permissions.text) permissions += "文本";
-        label(ui, permissions.empty() ? "仅建立连接" : permissions, {x + 14, y + 26, width - 126, 17}, 12, muted);
+        std::string policy;
+        if (device.permissions.download) policy += "下载  ";
+        if (device.permissions.upload) policy += "申请上传  ";
+        if (device.permissions.text) policy += "文本  ";
+        if (device.permissions.cast) policy += "屏幕";
+        label(ui, policy.empty() ? "仅建立连接" : policy, {x + 14, y + 26, width - 126, 17}, 12, muted);
         if (button(ui, "撤销信任", {x + width - 100, y + 8, 85, 32}, false, std::hash<std::string>{}(device.key))) {
             view.status = session.revoke_device(device.key) ? "设备信任已撤销" : "无法删除设备信任";
         }
@@ -676,7 +770,7 @@ void render_devices(Ui& ui, tempshare::Session& session, const tempshare::Snapsh
 }
 
 void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
-                 const tempshare::Snapshot& snapshot, View& view, float x, float width) {
+                 const tempshare::Snapshot& snapshot, View& view, float x, float width, const tempshare::HttpServer& http) {
     card(ui, {x, 106, width, 193});
     label(ui, "发送文本、链接或代码", {x + 18, 118, width - 36, 30}, 16, text, true);
     if (!paired(snapshot) || !snapshot.permissions.text) {
@@ -704,18 +798,43 @@ void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
     if (button(ui, "分享图片", {x + 218, 252, 97, 32})) share_paths(session, view, pick_paths(view, false), true);
     label(ui, "本会话的内容", {x, 313, width, 30}, 16, text, true);
     if (!snapshot.messages.empty() && button(ui, "清空", {x + width - 65, 313, 65, 30})) {
-        session.clear_messages();
+        view.confirm_clear = true;
     }
-    const auto first = page_controls(ui, view.message_page, snapshot.messages.size(), 3, x, 350, width);
-    float y = 386;
-    for (auto i = first; i < std::min(first + 3, snapshot.messages.size()); ++i, y += 80) {
-        const auto& entry = snapshot.messages[snapshot.messages.size() - 1 - i];
+    ui.input(&view.message_search, {x, 350, width - 96, 29}, Style().hint("搜索本会话消息"));
+    if (button(ui, "导出", {x + width - 86, 350, 86, 29})) {
+        const auto target = snapshot.directory / ("TempShare-消息-" + tempshare::random_token().substr(0, 8) + ".txt");
+        std::error_code error;
+        std::filesystem::create_directories(snapshot.directory, error);
+        std::ofstream output(target, std::ios::binary);
+        for (const auto& entry : snapshot.messages) output << (entry.from_desktop ? "本机" : "对方") << " · " << readable_time(entry.sent_at) << "\n" << entry.text << "\n\n";
+        output.close();
+        view.status = output ? "已导出到 " + target.u8string() : "导出失败，请检查接收目录";
+    }
+    std::vector<const tempshare::Message*> messages;
+    for (auto it = snapshot.messages.rbegin(); it != snapshot.messages.rend(); ++it)
+        if (view.message_search.empty() || it->text.find(view.message_search) != std::string::npos) messages.push_back(&*it);
+    const auto first = page_controls(ui, view.message_page, messages.size(), 2, x, 389, width);
+    float y = 423;
+    for (auto i = first; i < std::min(first + 2, messages.size()); ++i, y += 80) {
+        const auto& entry = *messages[i];
         card(ui, {x, y, width, 72});
-        label(ui, entry.from_desktop ? "本机" : "对方", {x + 13, y + 4, width - 32, 22}, 12, muted);
+        label(ui, std::string(entry.from_desktop ? "本机" : "对方") + " · " + readable_time(entry.sent_at),
+              {x + 13, y + 4, width - 32, 22}, 12, muted);
         ui.draw_text(entry.attachment.empty() ? entry.text : "图片 · " + entry.text,
                      {x + 13, y + 28, width - 98, 37}, text, Style().font(13).top().wrap_text());
-        if (button(ui, "复制", {x + width - 72, y + 22, 57, 28})) {
-            view.status = window.try_set_clipboard(entry.text) ? "已复制" : "无法写入剪贴板";
+        if (button(ui, entry.attachment.empty() ? "查看" : "打开", {x + width - 72, y + 22, 57, 28}, false, entry.sequence)) {
+            if (entry.attachment.empty()) { view.message_detail = entry; view.detail_text = entry.text; }
+            else if (entry.remote_attachment) {
+                open_url(http.url("127.0.0.1") + "peer#" + http.peer().browser_key() + ":sync");
+            } else {
+                const auto find = [&](const std::vector<tempshare::File>& files) {
+                    const auto file = std::find_if(files.begin(), files.end(), [&](const tempshare::File& file) { return file.id == entry.attachment; });
+                    return file == files.end() ? std::filesystem::path{} : file->path;
+                };
+                const auto all = session.snapshot(View::Page::all);
+                const auto path = entry.from_desktop ? find(all.shared) : find(all.received);
+                if (path.empty() || !open_folder(path)) view.status = "附件不可用，请查看文件页或接收记录";
+            }
         }
     }
 }
@@ -732,7 +851,9 @@ void render_cast(Ui& ui, tempshare::Session& session, const tempshare::HttpServe
           snapshot.viewer_answered ? "已完成媒体协商" : snapshot.capture_ready ? "等待对方观看" :
           snapshot.casting ? "等待本机选择共享来源" : "当前未共享",
           {x + 18, 157, width - 36, 26}, 13, snapshot.capture_ready ? online : muted);
-    if (!snapshot.capture_ready && button(ui, snapshot.casting ? "重新打开来源选择" : "选择共享来源",
+    if (!snapshot.capture_ready && snapshot.permissions.cast &&
+        (!server.peer().snapshot().attached || server.peer().snapshot().permissions.cast) &&
+        button(ui, snapshot.casting ? "重新打开来源选择" : "共享我的屏幕",
                {x + 18, 210, 170, 36}, true)) {
         const auto key = session.open_cast();
         if (key.empty() || !open_url(server.url("127.0.0.1") + "cast#" + key)) {
@@ -744,10 +865,25 @@ void render_cast(Ui& ui, tempshare::Session& session, const tempshare::HttpServe
         session.stop_cast();
         view.status = "投递已停止";
     }
+    const auto remote = server.peer().snapshot();
+    if (remote.attached && !remote.permissions.cast)
+        label(ui, "对方关闭了屏幕权限", {x + 18, 254, width - 36, 24}, 12, muted);
+    if (remote.attached) {
+        card(ui, {x, 316, width, 152});
+        label(ui, "观看对方 · " + remote.device, {x + 18, 331, width - 36, 30}, 16, text, true);
+        label(ui, remote.capture_ready ? "对方屏幕已就绪，可开始观看" : "等待对方点击共享我的屏幕",
+              {x + 18, 369, width - 36, 26}, 13, muted);
+        if (button(ui, "打开观看窗口", {x + 18, 412, 142, 34}, remote.capture_ready)) {
+            if (!open_url(server.url("127.0.0.1") + "peer#" + server.peer().browser_key() + ":cast"))
+                view.status = "无法打开观看窗口";
+        }
+        label(ui, remote.status, {x, 486, width, 28}, 12, muted);
+    }
 }
 
 void render_home(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers,
-                 float x, float width, float nearby_width) {
+                 float x, float width, float nearby_width, const std::function<void(const std::string&)>& join,
+                 const std::string& discovery_status) {
     struct Feature {
         const char* title;
         const char* detail;
@@ -757,11 +893,11 @@ void render_home(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers,
         Color top, bottom, tint;
     };
     const std::array<Feature, 3> features{{
-        {"文件分享", "传输文件和文件夹", "开始分享", View::Page::share, SystemIcon::Folder,
+        {"文件分享", "传输文件和文件夹", "打开文件页", View::Page::share, SystemIcon::Folder,
          {45, 65, 138}, {29, 38, 91}, {95, 186, 255}},
-        {"内容同步", "发送文本、链接或图片", "立即发送", View::Page::sync, SystemIcon::Text,
+        {"内容同步", "发送文本、链接或图片", "打开同步页", View::Page::sync, SystemIcon::Text,
          {69, 55, 135}, {42, 35, 89}, {184, 155, 255}},
-        {"屏幕投递", "共享屏幕或窗口", "开始投递", View::Page::cast, SystemIcon::Play,
+        {"屏幕投递", "共享屏幕或窗口", "打开投屏页", View::Page::cast, SystemIcon::Play,
          {39, 76, 131}, {25, 46, 75}, {114, 200, 255}},
     }};
     constexpr float gap = 14;
@@ -790,8 +926,8 @@ void render_home(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers,
     if (peers.empty()) {
         card(ui, {x, 348, nearby_width, 84});
         ui.system_icon(SystemIcon::Network, {x + 16, 371, 34, 34}, accent);
-        label(ui, "正在查找附近的 TempShare 设备", {x + 64, 357, nearby_width - 80, 29}, 14, text, true);
-        label(ui, "也可用手机扫描右侧二维码", {x + 64, 386, nearby_width - 80, 22}, 12, muted);
+        label(ui, discovery_status, {x + 64, 357, nearby_width - 80, 29}, 13, text, true);
+        label(ui, "电脑可在附近设备页粘贴地址；手机可扫码加入", {x + 64, 386, nearby_width - 80, 22}, 12, muted);
     }
     for (std::size_t i = 0; i < std::min<std::size_t>(peers.size(), 4); ++i) {
         const auto& peer = peers[i];
@@ -801,9 +937,7 @@ void render_home(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers,
         label(ui, peer.name, {x + 55, y + 4, nearby_width - 146, 24}, 14, text, true);
         label(ui, peer.platform + " · " + peer.address, {x + 55, y + 28, nearby_width - 146, 19}, 12, muted);
         if (button(ui, "连接", {x + nearby_width - 75, y + 12, 61, 30}, false,
-                   std::hash<std::string>{}(peer.url())) && !open_url(peer.url())) {
-            view.status = "无法打开浏览器";
-        }
+                   std::hash<std::string>{}(peer.url()))) join(peer.url());
     }
 }
 
@@ -818,14 +952,13 @@ struct Connection {
     Connection(const Options& options, const std::filesystem::path& inbox, const std::filesystem::path& config,
                const std::function<void()>& repaint, std::size_t index)
         : session(inbox, repaint, std::chrono::minutes(30),
-                  options.cert.empty() || config.empty() ? std::filesystem::path{} :
-                      config / (index ? "trusted-" + std::to_string(index + 1) : "trusted"),
+                   options.cert.empty() || config.empty() ? std::filesystem::path{} : config / "trusted",
                   config.empty() ? std::filesystem::path{} :
                       config / (index ? "received-history-" + std::to_string(index + 1) : "received-history")),
-          http(session, options.cert, options.key) {
+          http(session, options.cert, options.key, repaint) {
         const unsigned preferred = options.port + static_cast<unsigned>(index);
         const auto port = static_cast<unsigned short>(preferred <= 65535 ? preferred : 0);
-        if (!http.start(port)) throw std::runtime_error("无法启动局域网服务，请检查端口与证书。");
+        if (!http.start(index ? 0 : port, index != 0)) throw std::runtime_error("无法启动局域网服务，请检查端口与证书。");
         session.start();
 #ifdef _WIN32
         last_notice = session.notification_state();
@@ -841,6 +974,7 @@ struct Connection {
 };
 
 int run(const Options& options) {
+
     aino::WindowConfig config;
     config.width = 1100;
     config.height = 720;
@@ -862,17 +996,52 @@ int run(const Options& options) {
     auto next_appearance_check = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     std::optional<bool> applied_dark;
     const auto inbox = receive_directory(options, config_path);
+    auto applied_directory = inbox;
 #ifdef _WIN32
     desktop.inbox = inbox;
-    bool close_dialog_open = false;
 #endif
+    bool close_dialog_open = false;
+    window.set_close_handler([&] { close_dialog_open = true; });
     constexpr std::size_t connection_limit = 4;
     std::array<std::shared_ptr<Connection>, connection_limit> connections;
     connections[0] = std::make_shared<Connection>(options, inbox, config_path, repaint, 0);
+    for (std::size_t index = 1; index < connections.size(); ++index)
+        connections[index] = std::make_shared<Connection>(options, inbox, config_path, repaint, index);
     const auto primary = connections.front();
+    std::vector<tempshare::HttpServer*> endpoints;
+    for (const auto& item : connections) endpoints.push_back(&item->http);
+    primary->http.configure_gateway(endpoints);
+    std::string device_identity;
+    std::string nickname;
+    { std::ifstream input(config_path / "device-id"); input >> device_identity; }
+    if (device_identity.size() != 32 || device_identity.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        device_identity = tempshare::random_token();
+        std::error_code error; std::filesystem::create_directories(config_path, error);
+        std::ofstream(config_path / "device-id") << device_identity;
+    }
+    { std::ifstream input(config_path / "device-name"); std::getline(input, nickname); }
+    if (!tempshare::valid_filename(nickname) || nickname.size() > 80) nickname = tempshare::device_hostname();
+    for (const auto& item : connections) item->http.peer().set_identity(device_identity, nickname);
     tempshare::Discovery discovery(primary->http.port(), !options.cert.empty(),
-                                   [primary] { return primary->http.networks(); }, repaint);
+                                   [primary] { return primary->http.networks(); }, repaint, device_identity, nickname);
     int selected_connection = 0;
+    bool requests_open = false;
+    const auto join_peer = [&](const std::string& address) {
+        auto slot = static_cast<std::size_t>(selected_connection);
+        if (connections[slot]->session.snapshot(View::Page::home).pairing || connections[slot]->http.peer().snapshot().attached) {
+            slot = 0;
+            while (slot < connections.size() && (connections[slot]->session.snapshot(View::Page::home).pairing ||
+                   connections[slot]->http.peer().snapshot().attached)) ++slot;
+        }
+        if (slot == connections.size()) {
+            connections[static_cast<std::size_t>(selected_connection)]->view.status = "当前设备已满，请先离开一个连接";
+        } else if (connections[slot]->http.peer().join(address)) {
+            selected_connection = static_cast<int>(slot);
+            connections[slot]->view.page = View::Page::cast;
+            connections[slot]->view.connection_open = true;
+        } else connections[slot]->view.status = "请输入局域网地址或完整邀请链接；HTTPS需要启用TLS的构建";
+        window.wake();
+    };
 
     // Refresh network addresses and periodically check for system appearance changes.
     std::mutex timer_mutex;
@@ -909,13 +1078,9 @@ int run(const Options& options) {
     try {
         window.run([&](Ui& ui) {
 #ifdef _WIN32
-            if (desktop.close_requested) {
-                desktop.close_requested = false;
-                close_dialog_open = true;
-            }
             if (desktop.clicked_connection >= 0 && desktop.clicked_connection < static_cast<int>(connections.size())) {
                 auto& target = connections[static_cast<std::size_t>(desktop.clicked_connection)];
-                if (target) {
+                if (target && target->session.invitation_active(desktop.clicked_invitation)) {
                     selected_connection = desktop.clicked_connection;
                     if (desktop.clicked_sync) target->view.page = View::Page::sync;
                     else target->view.connection_open = true;
@@ -927,6 +1092,11 @@ int run(const Options& options) {
             auto& session = connection->session;
             auto& http = connection->http;
             auto& view = connection->view;
+            const auto current_directory = session.snapshot(View::Page::home).directory;
+            if (current_directory != applied_directory) {
+                for (const auto& item : connections) item->session.set_directory(current_directory);
+                applied_directory = current_directory;
+            }
             if (view.folder_job.valid() && view.folder_job.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 view.folder_worker.join();
                 view.status = view.folder_job.get();
@@ -953,18 +1123,25 @@ int run(const Options& options) {
                 if (!item) continue;
                 const auto slot = static_cast<int>(i);
                 const auto notification = item->session.notification_state();
-                const auto& last = item->last_notice;
+                const auto invitation = item->session.snapshot(View::Page::home).invitation;
+                auto& last = item->last_notice;
                 if (notification.pairing != last.pairing && !notification.pairing.empty()) {
-                    desktop.notify(L"TempShare · 连接请求", L"点击核对手机上的验证码。", slot);
-                } else if (notification.received != last.received && !notification.received.empty()) {
-                    desktop.notify(L"TempShare · 文件已接收", L"文件已保存，点击打开 TempShare。", slot);
-                } else if (notification.offer != last.offer && !notification.offer.empty()) {
-                    desktop.notify(L"TempShare · 文件接收请求", L"点击查看并确认待接收文件。", slot);
-                } else if (notification.incoming_messages != last.incoming_messages) {
-                    desktop.notify(L"TempShare · 新消息", L"点击打开内容同步。", slot, true);
+                    if (desktop.notify(L"TempShare · 连接请求", L"点击核对对方设备上的验证码。", slot, invitation)) last.pairing = notification.pairing;
                 }
-                item->last_notice = notification;
+                if (notification.received != last.received && !notification.received.empty()) {
+                    if (desktop.notify(L"TempShare · 文件已接收", L"文件已保存，点击打开 TempShare。", slot, invitation)) last.received = notification.received;
+                }
+                if (notification.offer != last.offer && !notification.offer.empty()) {
+                    if (desktop.notify(L"TempShare · 文件接收请求", L"点击查看并确认待接收文件。", slot, invitation)) last.offer = notification.offer;
+                }
+                if (notification.incoming_messages != last.incoming_messages) {
+                    if (desktop.notify(L"TempShare · 新消息", L"点击打开内容同步。", slot, invitation, true)) last.incoming_messages = notification.incoming_messages;
+                }
+                if (notification.pairing.empty()) last.pairing.clear();
+                if (notification.offer.empty()) last.offer.clear();
+                if (notification.received.empty()) last.received.clear();
             }
+            desktop.pump_notifications();
 #endif
             if (appearance == system_appearance && now >= next_appearance_check) {
                 system_dark = system_dark_mode().value_or(true);
@@ -987,7 +1164,7 @@ int run(const Options& options) {
             constexpr float navigation_width = side_width - navigation_inset * 2;
             constexpr float x = side_width + 28;
             const float rail_left = width - 284;
-            const bool auto_hide = width < 990 && view.page != View::Page::home && !snapshot.pairing &&
+            const bool auto_hide = width < 1100 && view.page != View::Page::home &&
                 !view.connection_open && !view.diagnostics_open;
             const float content_width = auto_hide ? width - x - 28 : rail_left - x - 18;
             ui.clear(background);
@@ -1002,7 +1179,7 @@ int run(const Options& options) {
                 view.confirm_end = false;
             }
             const std::array<const char*, 8> titles{
-                "首页", "文件分享", "内容同步", "屏幕投递", "附近设备", "接收记录", "设备信任", "设置"
+                "首页", "文件分享", "内容同步", "屏幕投递", "附近设备", "接收记录", "设备与权限", "设置"
             };
             constexpr std::array<View::Page, 8> pages{View::Page::home, View::Page::share, View::Page::sync, View::Page::cast,
                 View::Page::nearby, View::Page::received, View::Page::devices, View::Page::settings};
@@ -1032,34 +1209,35 @@ int run(const Options& options) {
             constexpr float divider = nav_top + nav_step * group_start + (group_gap + nav_height - nav_step) / 2;
             ui.fill_rect({23, divider, side_width - 46, 1}, border);
             std::vector<std::string> devices;
+            std::vector<int> device_slots;
             for (const auto& item : connections) {
                 if (!item) break;
                 const auto state = item->session.snapshot(View::Page::home);
-                auto name = "连接 " + std::to_string(devices.size() + 1) + " · ";
-                name += state.pairing ? (state.pairing->state == State::pending ? "待确认" : state.pairing->name) :
-                    state.active ? "待配对" : "已结束";
+                const auto slot = static_cast<int>(&item - connections.data());
+                const auto remote = item->http.peer().snapshot();
+                if (slot != selected_connection && !state.pairing && !remote.attached) continue;
+                std::string name = state.pairing ? (state.pairing->state == State::pending ? "待确认 · " : "已配对 · ") : "邀请设备 · ";
+                name += remote.attached ? remote.device : state.pairing ? state.pairing->name : "本机";
                 devices.push_back(std::move(name));
+                device_slots.push_back(slot);
             }
-            if (ui.select(devices, &selected_connection, {navigation_inset, 447, navigation_width, 29}, Style().font(12))) {
+            int selected_device = static_cast<int>(std::find(device_slots.begin(), device_slots.end(), selected_connection) - device_slots.begin());
+            if (ui.menu(devices[static_cast<std::size_t>(selected_device)], devices, &selected_device,
+                        {navigation_inset, 447, navigation_width, 29}, Style().font(12))) {
+                selected_connection = device_slots[static_cast<std::size_t>(selected_device)];
                 window.wake();
             }
-            if (button(ui, "＋ 新建连接", {navigation_inset, 486, navigation_width, 29})) {
+            if (button(ui, "＋ 邀请设备", {navigation_inset, 486, navigation_width, 29})) {
                 std::size_t slot = 0;
-                while (slot < connections.size() && connections[slot] && connections[slot]->session.is_active()) ++slot;
+                while (slot < connections.size() && (connections[slot]->session.snapshot(View::Page::home).pairing ||
+                       connections[slot]->http.peer().snapshot().attached)) ++slot;
                 if (slot == connections.size()) view.status = "最多同时使用 4 个连接，可先结束一个";
                 else {
-                    try {
-                        if (connections[slot]) {
-                            connections[slot]->session.start();
-                            connections[slot]->view.page = View::Page::home;
-                        } else {
-                            auto next = std::make_shared<Connection>(options, snapshot.directory, config_path, repaint, slot);
-                            std::lock_guard lock(timer_mutex);
-                            connections[slot] = std::move(next);
-                        }
-                        selected_connection = static_cast<int>(slot);
-                        window.wake();
-                    } catch (const std::exception& error) { view.status = error.what(); }
+                    if (!connections[slot]->session.is_active()) connections[slot]->session.start();
+                    connections[slot]->view.page = View::Page::home;
+                    connections[slot]->view.connection_open = true;
+                    selected_connection = static_cast<int>(slot);
+                    window.wake();
                 }
             }
             ui.fill_circle(23, height - 70, 3.5f, snapshot.active ? online : muted);
@@ -1073,6 +1251,20 @@ int run(const Options& options) {
                 window.wake();
             }
             const auto page = view.page;
+            std::vector<std::string> requests;
+            std::size_t request_count = 0;
+            for (const auto& item : connections) {
+                const auto summary = item->session.snapshot(View::Page::home);
+                std::string request;
+                if (summary.pairing && summary.pairing->state == State::pending && !item->http.peer().snapshot().outgoing)
+                    request = summary.pairing->name + " · 请求连接";
+                else if (!summary.offers.empty()) request = summary.pairing ? summary.pairing->name + " · 有文件待接收" : "文件请求";
+                if (!request.empty()) ++request_count;
+                requests.push_back(std::move(request));
+            }
+            if (button(ui, "待处理 " + std::to_string(request_count), {navigation_inset, 526, navigation_width, 28})) requests_open = true;
+            if ((!snapshot.downloads.empty() || !view.failed_files.empty()) &&
+                button(ui, "传输活动与失败", {navigation_inset, 562, navigation_width, 28})) view.downloads_open = true;
             if (!auto_hide && !view.diagnostics_open) {
                 render_connection(ui, window, session, http, snapshot, http.networks(), view, rail_left,
                                   page == View::Page::home ? 301.f : 106.f);
@@ -1089,7 +1281,7 @@ int run(const Options& options) {
             } else if (auto_hide) {
                 if (button(ui, "连接设备", {width - 120, 44, 92, 30})) view.connection_open = true;
             } else {
-                const float diagnostic_y = page == View::Page::home ? 650.0f : 463.0f;
+                const float diagnostic_y = page == View::Page::home ? std::min(650.0f, height - 36.0f) : 463.0f;
                 if (button(ui, "连接诊断", {rail_left + 18, diagnostic_y, 103, 25})) {
                     view.diagnostics_open = true;
                     view.diagnosis = "正在测试本机监听和当前局域网地址…";
@@ -1107,7 +1299,7 @@ int run(const Options& options) {
                         return diagnosis;
                     });
                 }
-                if (width < 990 && page != View::Page::home && !snapshot.pairing &&
+                if (width < 1100 && page != View::Page::home &&
                     button(ui, "收起连接栏", {rail_left + 132, diagnostic_y, 106, 25})) view.connection_open = false;
             }
             if (page != view.page) snapshot = session.snapshot(view.page);
@@ -1116,24 +1308,53 @@ int run(const Options& options) {
                   {x, 24, content_width, 50}, 29, text, true);
             if (view.page == View::Page::home) {
                 label(ui, "选择一种方式开始分享", {x, 69, content_width, 22}, 13, muted);
+            } else {
+                const auto remote = http.peer().snapshot();
+                const auto target = remote.attached ? remote.device : snapshot.pairing ? snapshot.pairing->name : std::string{};
+                label(ui, target.empty() ? "邀请设备或在附近设备中发起连接" : "当前设备 · " + target,
+                      {x, 77, content_width, 20}, 12, muted);
+                if (!target.empty()) ui.tooltip({x, 77, content_width, 20}, "当前设备 · " + target +
+                    (remote.attached ? "\n" + remote.address + " · " + remote.device_id.substr(0, 8) : ""));
             }
 
             switch (view.page) {
             case View::Page::all: break;
             case View::Page::home:
-                render_home(ui, view, discovery.peers(), x, width - x - 28, content_width);
+                render_home(ui, view, discovery.peers(), x, width - x - 28, content_width, join_peer, discovery.status());
                 if (page != view.page) window.wake();
                 break;
             case View::Page::share:
-                render_share(ui, window, session, snapshot, view, x, content_width, height - 53);
+                if (http.peer().snapshot().attached) {
+                    static const std::vector<std::string> directions{"本机共享与接收请求", "对方共享文件"};
+                    int direction = view.remote_files ? 1 : 0;
+                    if (ui.segmented(directions, &direction, {x, 97, content_width, 32}, Style().font(12)))
+                        view.remote_files = direction == 1;
+                    if (view.remote_files) render_remote_files(ui, http, session, view, x, content_width, height - 53);
+                    else {
+                        render_share(ui, window, session, snapshot, view, x, content_width, height - 53);
+                    }
+                } else render_share(ui, window, session, snapshot, view, x, content_width, height - 53);
                 break;
-            case View::Page::sync: render_sync(ui, window, session, snapshot, view, x, content_width); break;
+            case View::Page::sync: render_sync(ui, window, session, snapshot, view, x, content_width, http); break;
             case View::Page::cast: render_cast(ui, session, http, snapshot, view, x, content_width); break;
-            case View::Page::nearby: render_nearby(ui, view, discovery, !http.networks().empty(), x, content_width); break;
+            case View::Page::nearby: render_nearby(ui, view, discovery, !http.networks().empty(), x, content_width, join_peer); break;
             case View::Page::received: render_received(ui, window, session, view, snapshot, x, content_width, height - 53); break;
             case View::Page::devices: render_devices(ui, session, snapshot, view, x, content_width); break;
             case View::Page::settings:
                 render_settings(ui, view, session, snapshot, config_path, x, content_width);
+                if (view.device_name.empty()) view.device_name = nickname;
+                ui.input(&view.device_name, {x, 488, content_width - 102, 32}, Style().hint("本机设备名称"));
+                if (button(ui, "保存名称", {x + content_width - 92, 488, 92, 32})) {
+                    if (tempshare::valid_filename(view.device_name) && view.device_name.size() <= 80) {
+                        std::ofstream output(config_path / "device-name"); output << view.device_name; output.close();
+                        if (output) {
+                            nickname = view.device_name; discovery.set_name(nickname);
+                            for (const auto& item : connections) item->http.peer().set_identity(device_identity, nickname);
+                            view.status = "设备名称已保存";
+                        }
+                        else view.status = "无法保存设备名称";
+                    } else view.status = "请输入有效设备名称（最多80字节）";
+                }
 #ifdef _WIN32
                 label(ui, "TempShare " TEMPSHARE_VERSION, {x, 585, 123, 32}, 13, muted);
                 if (button(ui, "检查更新", {x + 128, 585, 86, 32}) && !desktop.updates()) {
@@ -1143,51 +1364,148 @@ int run(const Options& options) {
                 break;
             }
             label(ui, view.status, {x, height - 43, content_width, 27}, 12, muted);
-#ifdef _WIN32
+            if (view.batch_open) {
+                const Rect box{(width - 500) / 2, (height - 420) / 2, 500, 420};
+                std::uint64_t total = 0;
+                std::vector<const tempshare::Offer*> entries;
+                const auto current = session.snapshot(View::Page::share);
+                for (const auto& offer : current.offers) if (std::find(view.batch_ids.begin(), view.batch_ids.end(), offer.id) != view.batch_ids.end()) {
+                    entries.push_back(&offer); total += offer.size;
+                }
+                std::error_code error; const auto disk = std::filesystem::space(current.directory, error);
+                const auto body = std::to_string(entries.size()) + " 个文件 · " + readable_size(total) + "\n保存到 " +
+                    current.directory.u8string() + (error ? "\n目录将在接收时创建" : "\n可用空间 " + readable_size(disk.available));
+                if (ui.dialog(view.batch_accept ? "确认接收整批文件" : "确认拒绝整批文件", body, &view.batch_open, box)) {
+                    ui.scroll({box.x + 20, box.y + 150, box.w - 40, 200}, static_cast<int>(entries.size()), 30,
+                        [&](int index, const Rect& row) { label(ui, entries[static_cast<std::size_t>(index)]->name, row, 13); });
+                    if (button(ui, view.batch_accept ? "确认接收" : "确认拒绝", {box.x + 20, box.bottom() - 49, 120, 30}, true)) {
+                        const auto count = session.decide_offers(view.batch_ids, view.batch_accept);
+                        view.status = "已处理 " + std::to_string(count) + " 个请求"; view.batch_open = false;
+                    }
+                    if (button(ui, "取消", {box.right() - 110, box.bottom() - 49, 90, 30})) view.batch_open = false;
+                }
+            }
+            if (view.downloads_open) {
+                const Rect box{(width - 500) / 2, (height - 400) / 2, 500, 400};
+                if (ui.dialog("对方下载活动", "显示本机传输结果；浏览器是否保存到磁盘由对方确认。", &view.downloads_open, box)) {
+                    const auto current = session.snapshot(View::Page::share);
+                    ui.scroll({box.x + 20, box.y + 85, box.w - 40, 260}, static_cast<int>(current.downloads.size()), 48,
+                        [&](int index, const Rect& row) {
+                            const auto& download = current.downloads[current.downloads.size() - 1 - static_cast<std::size_t>(index)];
+                            label(ui, download.name, {row.x, row.y, row.w, 23}, 13);
+                            label(ui, download.finished ? (download.success ? "本机发送完成，保存状态由对方确认" : "下载中断，对方可以重试") :
+                                  "正在发送 " + readable_size(download.transferred) + " / " + readable_size(download.size),
+                                  {row.x, row.y + 23, row.w, 21}, 11, muted);
+                        });
+                    if (button(ui, "关闭", {box.right() - 110, box.bottom() - 45, 90, 30})) view.downloads_open = false;
+                    if (!view.failed_files.empty()) {
+                        if (button(ui, "失败详情", {box.x + 20, box.bottom() - 45, 105, 30})) {
+                            view.message_detail = tempshare::Message{view.file_failures, true}; view.detail_text = view.file_failures;
+                        }
+                        if (button(ui, "重试失败项", {box.x + 136, box.bottom() - 45, 115, 30})) {
+                            const auto files = view.failed_files; share_paths(session, view, files);
+                        }
+                    }
+                }
+            }
+            if (requests_open) {
+                const Rect box{(width - 420) / 2, (height - 330) / 2, 420, 330};
+                if (ui.dialog("所有设备的待处理请求", "选择设备查看配对或文件请求。", &requests_open, box)) {
+                    float request_y = box.y + 91;
+                    for (std::size_t slot = 0; slot < requests.size(); ++slot) {
+                        if (requests[slot].empty()) continue;
+                        if (button(ui, requests[slot], {box.x + 20, request_y, box.w - 40, 35}, false, 9100 + slot)) {
+                            selected_connection = static_cast<int>(slot);
+                            connections[slot]->view.connection_open = true;
+                            connections[slot]->view.page = View::Page::share;
+                            requests_open = false;
+                        }
+                        request_y += 42;
+                    }
+                    if (!request_count) label(ui, "当前没有待处理请求", {box.x + 20, request_y, box.w - 40, 28}, 14, muted);
+                }
+            }
+            if (view.confirm_clear) {
+                const Rect box{(width - 400) / 2, (height - 210) / 2, 400, 210};
+                if (ui.alert_dialog("清空双方的消息？", "此操作删除当前会话双方的同步记录，已保存文件保留。", "清空双方记录", "取消",
+                                    &view.confirm_clear, box, Style().destructive())) session.clear_messages();
+            }
+            if (view.permissions_pending) {
+                bool open = true;
+                const Rect box{(width - 400) / 2, (height - 210) / 2, 400, 210};
+                if (ui.alert_dialog("停止相关任务并撤销权限？", "关闭文件接收或屏幕权限会停止正在进行的相关任务。已有消息和已保存文件保留。", "撤销权限", "保留权限",
+                                    &open, box, Style().destructive())) {
+                    session.set_permissions(*view.permissions_pending); view.permissions_pending.reset();
+                } else if (!open) view.permissions_pending.reset();
+            }
+            if (view.confirm_leave) {
+                const Rect box{(width - 400) / 2, (height - 210) / 2, 400, 210};
+                if (ui.alert_dialog("离开此设备？", "将停止本设备的投屏与未完成传输，共享清单和消息仍保留在本机会话。", "离开设备", "继续连接",
+                                    &view.confirm_leave, box)) {
+                    if (snapshot.pairing) session.disconnect(snapshot.pairing->token);
+                    http.peer().leave();
+                }
+            }
+            if (view.message_detail) {
+                bool open = true;
+                const Rect box{(width - 540) / 2, (height - 420) / 2, 540, 420};
+                ui.dialog("消息详情", "", &open, box);
+                ui.textarea(&view.detail_text, {box.x + 20, box.y + 56, box.w - 40, 270}, Style().font(14));
+                if (button(ui, "复制原文", {box.x + 20, box.bottom() - 56, 105, 32}))
+                    view.status = window.try_set_clipboard(view.message_detail->text) ? "已复制" : "复制失败";
+                const auto& value = view.message_detail->text;
+                if ((value.rfind("https://", 0) == 0 || value.rfind("http://", 0) == 0) && value.find_first_of(" \r\n\t") == std::string::npos &&
+                    button(ui, "打开链接", {box.x + 136, box.bottom() - 56, 105, 32})) open_url(value);
+                if (button(ui, "关闭", {box.right() - 110, box.bottom() - 56, 90, 32}) || !open) view.message_detail.reset();
+            }
             if (close_dialog_open) {
+                bool can_tray = false;
+#ifdef _WIN32
+                can_tray = desktop.tray;
+#endif
                 const float dialog_width = std::min(390.0f, width - 40.0f);
                 const Rect dialog{(width - dialog_width) / 2.0f, (height - 194.0f) / 2.0f,
                                   dialog_width, 194.0f};
                 bool open = true;
                 ui.dialog("关闭 TempShare",
-                          desktop.tray ? "缩小到托盘后，连接和传输会继续运行。直接退出会结束当前会话。"
+                          can_tray ? "缩小到托盘后，连接和传输会继续运行。直接退出会结束当前会话。"
                                        : "直接退出会结束当前会话。",
                           &open, dialog);
                 const float button_y = dialog.bottom() - 46.0f;
                 const float gap = 8.0f;
-                const float button_width = desktop.tray ? (dialog.w - 48.0f - gap * 2.0f) / 3.0f
+                const float button_width = can_tray ? (dialog.w - 48.0f - gap * 2.0f) / 3.0f
                                                         : (dialog.w - 48.0f - gap) / 2.0f;
                 float button_x = dialog.x + 24.0f;
-                if (desktop.tray && button(ui, "缩小到托盘", {button_x, button_y, button_width, 30})) {
+#ifdef _WIN32
+                if (can_tray && button(ui, "缩小到托盘", {button_x, button_y, button_width, 30})) {
                     desktop.minimize();
                     close_dialog_open = false;
-                    desktop.close_prompt = false;
                 }
-                if (desktop.tray) button_x += button_width + gap;
+#endif
+                if (can_tray) button_x += button_width + gap;
                 if (button(ui, "直接退出", {button_x, button_y, button_width, 30}, true)) {
-                    desktop.allow_exit = true;
                     close_dialog_open = false;
-                    desktop.close_prompt = false;
                     window.close();
                 }
                 button_x += button_width + gap;
                 if (button(ui, "继续使用", {button_x, button_y, button_width, 30})) {
                     close_dialog_open = false;
-                    desktop.close_prompt = false;
                 }
                 if (!open) {
                     close_dialog_open = false;
-                    desktop.close_prompt = false;
                 }
             }
-#endif
         });
     } catch (...) {
         stop_timer();
+        primary->http.stop();
+        for (const auto& connection : connections) if (connection) connection->http.stop();
         for (const auto& connection : connections) if (connection) connection->session.end();
         throw;
     }
     stop_timer();
+    primary->http.stop();
+    for (const auto& connection : connections) if (connection) connection->http.stop();
     for (const auto& connection : connections) if (connection) connection->session.end();
     return 0;
 }

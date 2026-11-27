@@ -17,6 +17,8 @@ struct Peer {
     std::string name;
     std::string platform;
     bool secure;
+    std::string id;
+    std::vector<std::string> addresses;
 
     std::string url() const;
 };
@@ -34,16 +36,19 @@ struct LocalNetwork {
 std::vector<LocalNetwork> lan_networks();
 std::string device_hostname();
 bool is_private_ipv4(const std::string& address);
+std::vector<std::string> resolve_lan_addresses(const std::string& hostname);
 bool permits_private_lan_peer(const std::vector<LocalNetwork>& interfaces,
                               const std::string& local, const std::string& remote);
 
 class Discovery {
 public:
     Discovery(unsigned short port, bool secure, std::function<std::vector<LocalNetwork>()> networks,
-              std::function<void()> changed);
+              std::function<void()> changed, std::string id = {}, std::string name = {});
     ~Discovery();
     std::vector<Peer> peers() const;
     void refresh();
+    std::string status() const;
+    void set_name(std::string name);
 
 private:
     void run();
@@ -63,6 +68,9 @@ private:
     mutable std::mutex mutex_;
     std::vector<Seen> peers_;
     std::thread worker_;
+    std::string id_;
+    std::string name_;
+    std::string status_ = "正在扫描本地网络";
 };
 
 }  // namespace tempshare

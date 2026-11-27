@@ -4,6 +4,14 @@ import { gather, peerConnection, timedFetch } from './rtc.js';
 import { fingerprint, forgetUpload, rememberUpload, resumableUploads, savedHandle } from './resume.js';
 
 const byId = (id) => document.getElementById(id);
+const mount = location.pathname.match(/^\/s\/[1-4](?=\/|$)/)?.[0] || '';
+const nativePeer = location.pathname === mount + '/peer';
+const apiBase = mount + (nativePeer ? '/peer' : '');
+function api(path) {
+  const url = new URL(path, location.href);
+  if (url.origin === location.origin && url.pathname.startsWith('/api/')) url.pathname = apiBase + url.pathname;
+  return url.href;
+}
 const pairForm = byId('pair-form');
 const dropzone = byId('dropzone');
 const fileInput = byId('file-input');
@@ -83,11 +91,14 @@ function showConnection(state, verification = '', reason = '') {
   connection = state;
   byId('connection').dataset.state = state;
   const connected = state === 'approved';
+  byId('session-deadline').hidden = !connected;
+  byId('extend-session').hidden = !connected;
   byId('connection').textContent = connected && computerName ? `${computerName} · ${badge}` : badge;
   document.body.classList.toggle('paired', connected);
   const disconnect = byId('disconnect');
   disconnect.hidden = state === '';
-  disconnect.textContent = state === 'pending' ? '取消请求' : '断开';
+  disconnect.textContent = state === 'pending' ? '取消请求' : '离开';
+  disconnect.title = '离开会撤销本浏览器中该设备的全部标签连接；共享清单和消息保留';
   byId('retry-connection').hidden = state !== '' || pairing;
   byId('connect-title').textContent = title;
   byId('connect-description').textContent = state === 'pending' && sessionSeconds
@@ -125,6 +136,8 @@ function showConnection(state, verification = '', reason = '') {
       approval_expired: '等待确认超时。请使用电脑上的新连接码。',
       session_expired: '会话已到期。请在电脑上新建会话，再扫码或输入连接码。',
       session_ended: '连接已结束。请使用电脑上显示的新连接码。',
+      device_left: '设备已离开。共享内容仍保留，可重新发起连接。',
+      pairing_cancelled: '连接请求已取消，可以重新连接。',
     };
     message(reasons[reason] || reasons.session_ended, true);
   } else if (changed) {
@@ -133,7 +146,7 @@ function showConnection(state, verification = '', reason = '') {
 }
 
 function request(path, method = 'GET', headers = {}, body) {
-  return timedFetch(path, { method, headers: method === 'GET' ? headers : { 'X-TempShare': '1', ...headers },
+  return timedFetch(api(path), { method, headers: method === 'GET' ? headers : { 'X-TempShare': '1', ...headers },
     body, cache: 'no-store' });
 }
 
@@ -167,9 +180,10 @@ async function askToPair(invitation) {
       'X-Device-Name': encodeURIComponent(device),
     });
     if (!response.ok) {
-      message(response.status === 403
-        ? '电脑拒绝了此连接。请查看桌面端的连接码并核对当前局域网地址。'
-        : '连接码已过期或不正确，请核对电脑上显示的连接码。', true);
+      const { code } = await response.json().catch(() => ({}));
+      message(({ device_busy: '此会话已有设备，请让电脑邀请另一台设备。',
+        session_expired: '会话已到期，请让电脑重新开启。',
+        invalid_invitation: '连接码不正确或已失效，请输入当前连接码。' })[code] || '暂时无法配对，请检查电脑状态后重试。', true);
       return;
     }
     const data = await response.json();
@@ -291,8 +305,8 @@ function downloadRow(file, root) {
   }
   if (file.unavailable) return row;
   const link = element('a', 'download', '下载');
-  link.href = root ? `/api/folders/${encodeURIComponent(root.id)}/download/${encodeURIComponent(file.id)}` :
-    `/api/download/${encodeURIComponent(file.id)}`;
+  link.href = api(root ? `/api/folders/${encodeURIComponent(root.id)}/download/${encodeURIComponent(file.id)}` :
+    `/api/download/${encodeURIComponent(file.id)}`);
   link.download = file.name;
   link.setAttribute('aria-label', `下载 ${file.name}`);
   const error = element('p', 'download-error', '');
@@ -364,7 +378,7 @@ function updateZipLink() {
   const current = folderPath[folderPath.length - 1];
   link.hidden = !current || (selectingFolder && !selectedFolderEntries.size);
   if (link.hidden) return;
-  const href = new URL(`/api/folders/${root.id}/zip/${current.id}`, location.href);
+  const href = new URL(api(`/api/folders/${root.id}/zip/${current.id}`));
   if (selectingFolder) for (const id of selectedFolderEntries) href.searchParams.append('file', id);
   link.href = href.href;
   link.textContent = selectingFolder ? `下载所选 ${selectedFolderEntries.size} 项 ZIP` : '整目录 ZIP';
@@ -515,6 +529,13 @@ function showMessages(entries, refresh = false) {
   if (!refresh && tab !== 'sync') {
     const previous = new Set(syncMessages.map((entry) => JSON.stringify(entry)));
     unreadMessages += entries.filter((entry) => entry.desktop && !previous.has(JSON.stringify(entry))).length;
+    const added = entries.filter((entry) => entry.desktop && !previous.has(JSON.stringify(entry)));
+    if (added.length && document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+      try {
+        const notice = new Notification(computerName || 'TempShare', { body: `收到 ${added.length} 条新消息`, tag: location.host + mount });
+        notice.onclick = () => { window.focus(); showTab('sync'); notice.close(); };
+      } catch { /* 部分移动浏览器仅允许Service Worker通知，仍保留页内未读提醒。 */ }
+    }
     if (!entries.length) unreadMessages = 0;
     byId('sync-unread').textContent = unreadMessages ? ` · ${unreadMessages}` : '';
     byId('sync-unread').hidden = !unreadMessages;
@@ -543,7 +564,7 @@ function showMessages(entries, refresh = false) {
     const time = entry.sentAt ? ' · ' + new Date(entry.sentAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
     content.append(element('p', 'file-meta', (entry.desktop ? '电脑' : '本机') + time));
     if (entry.attachment) {
-      const href = '/api/text/attachment/' + encodeURIComponent(entry.attachment);
+      const href = api('/api/text/attachment/' + encodeURIComponent(entry.attachment));
       if (entry.attachmentType?.startsWith('image/')) {
         const image = element('img', 'sync-image');
         image.alt = entry.text;
@@ -668,7 +689,7 @@ function stopViewing(notify = true) {
   byId('cast-mode').hidden = true;
   byId('cast-fullscreen').hidden = true;
   byId('resume-watching').hidden = true;
-  if (notify && wasWatching) fetch('/api/cast/viewer', {
+  if (notify && wasWatching) fetch(api('/api/cast/viewer'), {
     method: 'POST', headers: { 'X-TempShare': '1', 'X-Cast-Watch': '0', 'X-Cast-Viewer': viewer }, keepalive: true,
   }).catch(() => {});
 }
@@ -1061,7 +1082,7 @@ function transfer(item) {
   const end = Math.min(offset + chunkSize, item.file.size);
   updateItem(item, '正在发送', item.file.size ? offset / item.file.size * 100 : 0);
   const started = performance.now();
-  xhr.open('PUT', `/api/upload/${item.id}`);
+  xhr.open('PUT', api(`/api/upload/${item.id}`));
   xhr.timeout = 45000;
   xhr.setRequestHeader('X-TempShare', '1');
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
@@ -1162,13 +1183,17 @@ async function poll() {
       throw new Error('pair');
     }
     const { state, verification, upload, download, text, textRevision, castReady, filesRevision, offersRevision,
-      computer, remainingSeconds } = await pair.json();
+      computer, remainingSeconds, castAllowed } = await pair.json();
     if (attempt !== pairingAttempt) return;
     computerName = computer || '';
     sessionSeconds = remainingSeconds || 0;
     showConnection(state, verification);
     if (state !== 'approved') return;
-    showCastAvailability(castReady === true);
+    byId('session-deadline').textContent = sessionSeconds ? `会话剩余 ${Math.ceil(sessionSeconds / 60)} 分钟` : '任务完成后到期';
+    byId('session-deadline').hidden = false;
+    byId('extend-session').hidden = false;
+    if (sessionSeconds > 0 && sessionSeconds <= 120) message('会话即将到期，可点击延长；进行中的任务会获得完成宽限。');
+    showCastAvailability(castReady === true && castAllowed !== false);
     dropzone.hidden = !upload;
     byId('select-resumable').hidden = !upload || byId('resume-option').hidden || typeof window.showOpenFilePicker !== 'function';
     byId('directory-option').hidden = !upload || !('webkitdirectory' in byId('directory-input'));
@@ -1223,6 +1248,8 @@ async function poll() {
   } catch {
     if (connection) {
       interrupted = true;
+      byId('connection').textContent = `${computerName || '电脑'} · 连接中断，正在恢复`;
+      byId('connection').dataset.state = 'pending';
       message('与电脑的连接暂时中断，正在重试。', true);
     }
   } finally {
@@ -1269,6 +1296,7 @@ byId('sync-form').addEventListener('submit', sendText);
 byId('disconnect').addEventListener('click', async (event) => {
   const button = event.currentTarget;
   const wasPending = connection === 'pending';
+  if (!wasPending && !confirm('离开将撤销本浏览器中此设备全部标签的连接，停止投屏与未完成传输。共享内容和消息保留。是否离开？')) return;
   button.disabled = true;
   try {
     const response = await request('/api/pair', 'DELETE');
@@ -1390,15 +1418,37 @@ dropzone.addEventListener('drop', (event) => {
 });
 
 async function start() {
-  const invite = location.hash.slice(1);
+  const [invite, initialTab] = location.hash.slice(1).split(':');
   if (invite) history.replaceState(null, '', location.pathname);
+  if (nativePeer && invite) {
+    const response = await timedFetch(mount + '/peer/authorize', { method: 'POST',
+      headers: { 'X-TempShare': '1', 'X-Peer-Key': invite } });
+    if (!response.ok) { message('本机观看授权已失效，请从桌面重新打开。', true); return; }
+  }
+  if (nativePeer) {
+    tab = ['share', 'sync'].includes(initialTab) ? initialTab : 'cast'; trustedConnect.hidden = true;
+    for (const button of byId('feature-nav').querySelectorAll('[data-panel]'))
+      button.setAttribute('aria-pressed', String(button.dataset.panel === tab));
+  }
   await poll();
-  if (!connection && /^[0-9a-f]{32}$/.test(invite)) await askToPair(invite);
+  if (!nativePeer && !connection && /^[0-9a-f]{32}$/.test(invite)) await askToPair(invite);
   setInterval(() => {
-    if (!document.hidden || watching || queue.some((item) => !item.cancelled && !item.finished)) poll();
+    poll();
   }, pollInterval);
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
   setInterval(refreshCast, 500);
 }
 start();
   updateQueueSummary();
+
+byId('extend-session').addEventListener('click', async () => {
+  try {
+    if (!(await request('/api/pair/extend', 'POST')).ok) throw new Error('extend');
+    message('已延长会话30分钟'); poll();
+  } catch { message('无法延长，请检查连接后重试。', true); }
+});
+byId('enable-notifications').hidden = !('Notification' in window) || !window.isSecureContext;
+byId('enable-notifications').addEventListener('click', async () => {
+  const permission = await Notification.requestPermission();
+  message(permission === 'granted' ? '已开启此浏览器的消息通知' : '未开启通知，可在浏览器权限设置中修改');
+});

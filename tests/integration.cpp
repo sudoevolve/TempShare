@@ -2,6 +2,8 @@
 #include "core/folder_archive.hpp"
 #include "core/http_server.hpp"
 #include "core/session.hpp"
+#include "core/peer_link.hpp"
+#include "core/peer_wire.hpp"
 
 #include <httplib.h>
 
@@ -383,7 +385,7 @@ void lan_features(const fs::path& path) {
            400, "bound text request size");
     session.set_permissions({true, true, false});
     expect(browser.Get("/api/text", auth), 403, "revoke text permission");
-    require(session.snapshot().messages.empty(), "revoking text clears history");
+    require(!session.snapshot().messages.empty(), "revoking text preserves history until explicitly cleared");
 
     const auto offer = session.offer(pair->token, "resume.txt", 8);
     require(offer && session.decide_offer(offer->id, true), "approve resumable upload");
@@ -522,8 +524,15 @@ void trusted_devices(const fs::path& path) {
     const auto pair = session.reconnect(remembered);
     require(pair && session.permissions().download && !session.permissions().upload &&
             !session.permissions().text, "restore the updated permissions");
+    tempshare::Session other_slot(path / "other-slot", {}, 1min, trust);
+    other_slot.start();
+    const auto other_pair = other_slot.reconnect(remembered);
+    require(other_pair.has_value(), "device trust is reusable across session slots");
     require(session.revoke_device(remembered) && !session.authorized(pair->token) &&
             !session.reconnect(remembered), "revocation ends current trust and prevents future connections");
+    other_slot.expire();
+    require(!other_slot.authorized(other_pair->token) && !other_slot.reconnect(remembered),
+            "revocation is observed by another active slot and cannot be restored from stale cache");
 }
 
 void interaction_contracts(const fs::path& path) {
@@ -683,11 +692,163 @@ void transfer_capacity(const fs::path& path) {
            "slot released after completed request");
 }
 
+template<typename Predicate>
+void eventually(Predicate predicate, const char* description) {
+    const auto deadline = std::chrono::steady_clock::now() + 8s;
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(20ms);
+    require(predicate(), description);
+}
+
+void native_desktop_connections(const fs::path& path) {
+    tempshare::Session a(path / "native-a"), b(path / "native-b");
+    tempshare::HttpServer host_a(a), host_b(b);
+    require(host_a.start(0, true) && host_b.start(0, true), "start both native desktop listeners");
+    a.start(); b.start();
+    require(host_a.peer().join(host_b.url("127.0.0.1")), "join remote directly from native desktop");
+    eventually([&] { return b.snapshot().pairing.has_value(); }, "remote desktop receives approval request");
+    require(!host_a.peer().snapshot().approved && b.snapshot().pairing->state == tempshare::State::pending,
+            "desktop discovery never auto-approves remote access");
+    require(a.decide_pairing(a.snapshot().pairing->token, true), "simulate remote peer claiming its own approval");
+    std::this_thread::sleep_for(900ms);
+    require(b.snapshot().pairing->state == tempshare::State::pending,
+            "remote approval cannot bypass the receiving desktop's explicit consent");
+    require(b.decide_pairing(b.snapshot().pairing->token, true), "approve remote desktop");
+    eventually([&] { return host_a.peer().snapshot().approved && host_b.peer().snapshot().approved; },
+               "both native desktops track the same approved link");
+    require(a.snapshot().pairing && b.snapshot().pairing, "both desktop session views contain the peer");
+    require(!b.receive_peer_message("wrong-token", {"injected", true}), "stale or foreign link cannot inject native messages");
+    require(a.send_text(u8"A 发往 B\nhello") && b.send_text(u8"B 发往 A\nreply"), "both desktops send messages");
+    eventually([&] { return a.snapshot().messages.size() == 2 && b.snapshot().messages.size() == 2; },
+               "native messages synchronize in both directions without echo loops");
+    const auto key_a = a.open_cast();
+    require(!key_a.empty() && a.cast_ready(key_a), "joining desktop can publish its own screen");
+    eventually([&] { return host_b.peer().snapshot().capture_ready; }, "original host can watch joining desktop");
+    const auto key_b = b.open_cast();
+    require(!key_b.empty() && b.cast_ready(key_b), "original host can also publish its screen");
+    eventually([&] { return host_a.peer().snapshot().capture_ready; }, "both screen directions are available");
+    const auto file = path / "native-shared.txt";
+    std::ofstream(file) << "native file contents";
+    require(b.share(file), "native peer publishes a file");
+    eventually([&] { return host_a.peer().snapshot().files.size() == 1; }, "remote file list appears in native UI");
+    require(host_a.peer().download(host_a.peer().snapshot().files.front()), "native peer downloads selected file");
+    eventually([&] { return !host_a.peer().snapshot().transferring; }, "native download completes");
+    require(a.snapshot().received.size() == 1 && read(a.snapshot().received.front().path) == "native file contents",
+            "native download is saved and recorded");
+    httplib::Client browser("127.0.0.1", host_a.port());
+    expect(browser.Get("/peer/api/pair"), 403, "local bridge still requires its browser authorization");
+    const auto secret = host_a.peer().browser_key();
+    expect(browser.Post("/peer/authorize", {{"X-TempShare", "1"}, {"X-Peer-Key", secret}}, "", "text/plain"),
+           204, "authorize native peer viewing on loopback");
+    const httplib::Headers bridge{{"Cookie", "ts_peer_" + std::to_string(host_a.port()) + "=" + secret}};
+    expect(browser.Get("/peer/api/pair", bridge), 200, "local viewer reaches the remote session through native credentials");
+    a.clear_messages();
+    eventually([&] { return b.snapshot().messages.empty(); }, "explicit clear synchronizes to the peer");
+    host_a.peer().leave();
+    eventually([&] { return !host_b.peer().snapshot().attached; }, "both peers observe leave");
+    require(a.is_active() && b.is_active() && b.snapshot().shared.size() == 1,
+            "leaving keeps the session and published content");
+}
+
+void gateway_connections(const fs::path& path) {
+    tempshare::Session primary(path / "gateway-1"), secondary(path / "gateway-2"), guest(path / "gateway-guest");
+    tempshare::HttpServer public_server(primary), private_server(secondary), guest_server(guest);
+    require(public_server.start(0, true) && private_server.start(0, true) && guest_server.start(0, true),
+            "start native gateway test listeners");
+    public_server.configure_gateway({&public_server, &private_server});
+    primary.start(); secondary.start(); guest.start();
+    const auto occupied = primary.pair(primary.snapshot().invitation, "Already connected");
+    require(occupied && primary.decide_pairing(occupied->token, true), "occupy primary session");
+    httplib::Client browser("127.0.0.1", public_server.port());
+    const auto root = browser.Get("/");
+    expect(root, 302, "new browser is routed to an available session");
+    require(root->get_header_value("Location") == "/s/2/", "gateway chooses available session route");
+    expect(browser.Get("/s/2/"), 200, "secondary page uses public entry");
+    expect(browser.Get("/s/2/api/cast/host"), 403, "gateway does not expose capture authorization");
+    require(guest_server.peer().join(public_server.url("127.0.0.1")), "join a busy device through its single entry");
+    eventually([&] { return secondary.snapshot().pairing.has_value(); }, "gateway forwards to free native session");
+    require(secondary.decide_pairing(secondary.snapshot().pairing->token, true), "approve native guest on second session");
+    eventually([&] { return guest_server.peer().snapshot().approved && private_server.peer().snapshot().approved; },
+               "bidirectional native state works through a gateway route");
+    require(guest.send_text("gateway native message"), "send message through shared entry");
+    eventually([&] { return !secondary.snapshot().messages.empty(); }, "gateway message reaches only its session");
+    require(primary.snapshot().messages.empty(), "gateway preserves session isolation");
+    const auto outbound = path / "native-send.txt";
+    std::ofstream(outbound) << "send and save";
+    require(guest_server.peer().send(outbound), "native sender requests direct delivery");
+    eventually([&] { return !secondary.snapshot().offers.empty(); }, "receiver sees native file request");
+    require(secondary.decide_offer(secondary.snapshot().offers.front().id, true), "receiver explicitly approves native delivery");
+    eventually([&] { return !guest_server.peer().snapshot().transferring; }, "native send completes");
+    if (secondary.snapshot().received.empty()) std::cerr << guest_server.peer().snapshot().transfer_status << '\n';
+    require(secondary.snapshot().received.size() == 1 &&
+            read(secondary.snapshot().received.front().path) == "send and save", "native upload saves exact bytes");
+    require(guest_server.peer().send(outbound), "request a second native delivery before leaving");
+    eventually([&] { return secondary.snapshot().offers.size() == 2; }, "second delivery waits for approval");
+    guest_server.peer().leave();
+    eventually([&] { return !private_server.peer().snapshot().attached; }, "leave routed native connection");
+    eventually([&] { return !guest_server.peer().snapshot().transferring; }, "leaving cancels the pending native send");
+    require(secondary.snapshot().received.size() == 1 && secondary.snapshot().offers.back().state == tempshare::State::rejected,
+            "a departed sender cannot complete or retain an approved upload");
+    public_server.stop();
+    private_server.stop();
+    guest_server.stop();
+}
+
+
+void peer_protocol_contracts() {
+    const auto endpoint = tempshare::parse_lan_endpoint(" http://192.168.1.2:8787/s/2/#0123456789abcdef0123456789abcdef ");
+    require(endpoint && endpoint->route == "/s/2" && endpoint->invitation.size() == 32, "parse full LAN invitation links");
+    require(tempshare::parse_lan_endpoint("http://office-pc.local:8787").has_value(), "allow LAN hostnames for background private-address resolution");
+    require(!tempshare::parse_lan_endpoint("https://8.8.8.8:443") &&
+            !tempshare::parse_lan_endpoint("http://192.168.1.2:0") &&
+            !tempshare::parse_lan_endpoint("http://user@192.168.1.2") &&
+            !tempshare::parse_lan_endpoint("http://192.168.1.2/s/9"), "reject unsafe or malformed peer endpoints");
+    const std::vector<std::string> fields{"", u8"中文\n消息", std::string("a\0b", 3)};
+    const auto encoded = tempshare::peer_wire::encode(fields);
+    require(tempshare::peer_wire::decode(encoded) == fields, "binary peer fields preserve multiline UTF-8 and null bytes");
+    require(!tempshare::peer_wire::decode(encoded.substr(0, encoded.size() - 1)) &&
+            !tempshare::peer_wire::decode(std::string(4, '\xff')), "reject truncated and oversized peer fields");
+}
+
+void revised_session_lifecycle(const fs::path& path) {
+    tempshare::Session session(path, {}, 60ms);
+    session.start();
+    const auto pair = session.pair(session.snapshot().invitation, "Lifecycle peer");
+    require(pair && session.decide_pairing(pair->token, true), "approve lifecycle peer");
+    require(session.send_text("keep this message"), "create retained message");
+    session.set_permissions({true, true, false, true});
+    require(session.snapshot().messages.size() == 1 && !session.messages(pair->token), "permission hides messages without deleting them");
+    session.set_permissions({true, true, true, true});
+    require(session.messages(pair->token)->size() == 1, "restoring text permission restores access to history");
+    session.download_progress("active-download", "file.txt", 100, 10);
+    std::this_thread::sleep_for(80ms);
+    require(session.authorized(pair->token), "an active progressing task receives expiry grace");
+    session.download_finished("active-download", true);
+    require(!session.is_active(), "grace ends after the task completes");
+    session.download_progress("late-download", "late.txt", 100, 1);
+    require(!session.begin_upload("wrong-token", "missing", 1) && !session.uploading("wrong-token", "missing") &&
+            !session.downloading(pair->token, "missing") && !session.is_active(),
+            "late or unauthorized transfer probes never revive an expired session");
+    session.start();
+    const auto again = session.pair(session.snapshot().invitation, "screen peer");
+    require(again && session.decide_pairing(again->token, true), "approve screen peer");
+    session.set_permissions({true, true, true, false});
+    require(session.open_cast().empty(), "screen permission gates native capture authorization");
+    session.set_permissions({true, true, true, true});
+    const auto host = session.open_cast();
+    require(!host.empty() && session.cast_ready(host), "screen permission enables capture");
+    session.set_permissions({true, true, true, false});
+    require(!session.cast_host(host), "revoking screen permission invalidates capture keys");
+}
+
 }  // namespace
 
 int main() {
     try {
         Sandbox scratch;
+        peer_protocol_contracts();
+        revised_session_lifecycle(scratch.path);
+        native_desktop_connections(scratch.path);
+        gateway_connections(scratch.path);
         roundtrip(scratch.path);
         browsable_folders(scratch.path);
         upload_directories_and_history(scratch.path);

@@ -1,6 +1,7 @@
 #include "core/http_server.hpp"
 
 #include "core/session.hpp"
+#include "core/peer_link.hpp"
 #include "core/folder_archive.hpp"
 #include "web_assets.hpp"
 
@@ -28,7 +29,17 @@ constexpr std::size_t max_cast_frame_size = 384 * 1024;
 const char* boolean(bool value) { return value ? "true" : "false"; }
 
 bool local_socket(const Request& request) {
-    return request.local_addr == "127.0.0.1" && request.remote_addr == "127.0.0.1";
+    return request.local_addr == "127.0.0.1" && request.remote_addr == "127.0.0.1" &&
+        (!request.has_header("X-LAN-Source") || request.get_header_value("X-LAN-Source") == "127.0.0.1");
+}
+
+std::string remote_address(const Request& request) {
+    return request.remote_addr == "127.0.0.1" && request.has_header("X-LAN-Source") ?
+        request.get_header_value("X-LAN-Source") : request.remote_addr;
+}
+std::string local_address(const Request& request) {
+    return request.remote_addr == "127.0.0.1" && request.has_header("X-LAN-Local") ?
+        request.get_header_value("X-LAN-Local") : request.local_addr;
 }
 
 void fail(Response& response, int status, std::string_view message, std::string_view code = {}) {
@@ -195,20 +206,20 @@ void send_file(Session& session, const std::string& token, const File& file, Res
     const auto mime = preview ? preview_type(file) :
         file.temporary_directory ? "application/zip" : "application/octet-stream";
     if (mime.empty()) return fail(response, 415, "File preview is unavailable", "preview_unavailable");
-    const auto deadline = Session::Clock::now() + std::chrono::minutes(5);
     if (preview) response.set_header("Content-Security-Policy", "sandbox; default-src 'none'");
     response.set_header("Content-Disposition", std::string(preview ? "inline" : "attachment") + "; filename*=UTF-8''" +
                         httplib::encode_uri_component(file.name));
+    const auto activity = random_token();
     response.set_content_provider(static_cast<std::size_t>(file.size), std::string(mime),
         [&session, directory = file.temporary_directory, input, id = file.id, folder, version = file.source, attachment,
-         token, deadline](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
-            if (Session::Clock::now() >= deadline || (attachment ? !session.message_attachment(token, id) :
-                !session.downloading(token, id, folder))) return false;
+         token, activity, name = file.name, size = file.size](std::size_t offset, std::size_t length, httplib::DataSink& sink) {
+            session.download_progress(activity, name, size, offset);
+            if (attachment ? !session.message_attachment(token, id) : !session.downloading(token, id, folder)) return false;
             std::array<char, 64 * 1024> chunk{};
             const auto count = std::min(length, chunk.size());
             return input->read(offset, chunk.data(), count) && input->version() == version &&
                 sink.write(chunk.data(), count);
-        }, [slot](bool) {});
+        }, [slot, &session, activity](bool success) { session.download_finished(activity, success); });
 }
 
 struct UploadCleanup {
@@ -250,7 +261,11 @@ void register_pairing(httplib::Server& server, Session& session, bool secure,
                                                           const httplib::ContentReader&) {
         const auto name = decode_filename(request.get_header_value("X-Device-Name"));
         const auto pairing = session.pair(request.get_header_value("X-Invitation"), name.value_or("浏览器"));
-        if (!pairing) return fail(response, 403, "Invitation unavailable");
+        if (!pairing) {
+            const auto state = session.snapshot(SnapshotPage::home);
+            return fail(response, state.pairing ? 409 : 403, "Invitation unavailable",
+                        state.pairing ? "device_busy" : state.active ? "invalid_invitation" : "session_expired");
+        }
         response.set_header("Set-Cookie", auth_cookie() + "=" + pairing->token +
             "; Path=/; HttpOnly; SameSite=Strict" + (secure ? "; Secure" : ""));
         response.status = 201;
@@ -269,11 +284,12 @@ void register_pairing(httplib::Server& server, Session& session, bool secure,
     server.Get("/api/pair", [secure, &session, auth, auth_cookie](const Request& request, Response& response) {
         const auto pairing = session.pairing(auth(request));
         if (!pairing) return fail(response, 401, "Session is unavailable", session.pairing_error(auth(request)));
+        session.touch(pairing->token);
         const bool trusted = secure && !pairing->trusted_key.empty();
-        const auto trusted_cookie = auth_cookie() + "_trusted";
+        const auto trusted_cookie = std::string(trust_cookie);
         if (trusted && cookie_token(request, trusted_cookie) != pairing->trusted_key) {
             response.set_header("Set-Cookie", trusted_cookie + "=" + pairing->trusted_key +
-                "; Path=/api/pair; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict");
+                "; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict");
         }
         const auto permissions = session.permissions();
         response.set_content("{\"state\":" + json_string(state_name(pairing->state)) +
@@ -281,11 +297,17 @@ void register_pairing(httplib::Server& server, Session& session, bool secure,
             ",\"remainingSeconds\":" + std::to_string(pairing->remaining_seconds) +
             ",\"verification\":" + json_string(pairing->verification) + ",\"download\":" + boolean(permissions.download) +
             ",\"upload\":" + boolean(permissions.upload) + ",\"text\":" + boolean(permissions.text) +
+            ",\"castAllowed\":" + boolean(permissions.cast) +
             ",\"trusted\":" + boolean(trusted) + ",\"textRevision\":" +
             std::to_string(session.text_revision()) + ",\"castReady\":" +
             boolean(session.capture_ready(pairing->token).value_or(false)) + ",\"filesRevision\":" +
             std::to_string(session.files_revision()) + ",\"offersRevision\":" +
             std::to_string(session.offers_revision()) + "}", json);
+    });
+
+    server.Post("/api/pair/extend", [&session, auth](const Request& request, Response& response) {
+        if (!session.authorized(auth(request))) return fail(response, 403, "Connection approval required");
+        response.status = session.extend() ? 204 : 409;
     });
     server.Delete("/api/pair", [secure, &session, auth, auth_cookie](const Request& request, Response& response,
                                                             const httplib::ContentReader&) {
@@ -328,7 +350,11 @@ void register_cast(httplib::Server& server, Session& session, const Authorize& a
     server.Get("/api/cast/host", [&session, host_key](const Request& request, Response& response) {
         const auto signal = session.cast_host(host_key(request));
         if (!signal) return fail(response, 403, "Desktop cast authorization required");
-        response.set_content(cast_json(*signal), json);
+        const auto state = session.snapshot(SnapshotPage::home);
+        auto body = cast_json(*signal);
+        body.pop_back();
+        body += ",\"target\":" + json_string(state.pairing ? state.pairing->name : "未连接设备") + '}';
+        response.set_content(body, json);
     });
     server.Post("/api/cast/ready", [&session, host_key](const Request& request, Response& response,
                                                        const httplib::ContentReader&) {
@@ -355,14 +381,14 @@ void register_cast(httplib::Server& server, Session& session, const Authorize& a
                                                request.get_header_value("X-Cast-Viewer"),
                                                request.get_header_value("X-Cast-Frames") == "1");
         if (!signal) return fail(response, 409, "Another viewer is active", "viewer_busy");
-        if (!signal->offer.empty() && !local_socket(request)) signal->offer = lan_sdp(signal->offer, request.local_addr);
+        if (!signal->offer.empty() && !local_socket(request)) signal->offer = lan_sdp(signal->offer, local_address(request));
         response.set_content(cast_json(*signal), json);
     });
     server.Post("/api/cast/answer", [&session, auth](const Request& request, Response& response) {
         const auto token = auth(request);
         if (!session.authorized(token)) return fail(response, 403, "Connection approval required");
         const auto revision = number(request.get_header_value("X-Cast-Revision"));
-        auto answer = local_socket(request) ? lan_sdp(request.body) : lan_sdp(request.body, request.remote_addr, true);
+        auto answer = local_socket(request) ? lan_sdp(request.body) : lan_sdp(request.body, remote_address(request), true);
         if (answer.empty()) return fail(response, 409, "No private ICE candidate", "no_lan_candidate");
         if (!revision || *revision > std::numeric_limits<unsigned>::max() ||
             !session.cast_answer(token, static_cast<unsigned>(*revision), std::move(answer),
@@ -538,6 +564,7 @@ void register_transfers(httplib::Server& server, Session& session, const Authori
                                          directory, request.get_header_value("X-Upload-Image") == "1");
         if (!offer) return fail(response, 409, "Unable to create a new request");
         response.status = 201;
+        response.set_header("X-Offer-ID", offer->id);
         response.set_content(offer_json(*offer), json);
     });
     server.Get("/api/offers", [&session, auth](const Request& request, Response& response) {
@@ -591,9 +618,8 @@ void register_transfers(httplib::Server& server, Session& session, const Authori
         output.seekp(static_cast<std::streamoff>(offset.value_or(0)));
 
         std::uint64_t written = 0;
-        const auto deadline = Session::Clock::now() + (offset ? std::chrono::seconds(40) : std::chrono::seconds(300));
         if (!read([&](const char* data, std::size_t length) {
-            if (length > *size - written || Session::Clock::now() >= deadline || !session.uploading(token, id)) return false;
+            if (length > *size - written || !session.uploading(token, id)) return false;
             output.write(data, static_cast<std::streamsize>(length));
             written += length;
             return static_cast<bool>(output);
@@ -614,8 +640,9 @@ void register_transfers(httplib::Server& server, Session& session, const Authori
 
 }  // namespace
 
-HttpServer::HttpServer(Session& session, const std::string& certificate, const std::string& key)
-    : secure_(!certificate.empty() || !key.empty()) {
+HttpServer::HttpServer(Session& session, const std::string& certificate, const std::string& key,
+                       std::function<void()> changed)
+    : session_(session), secure_(!certificate.empty() || !key.empty()), gateway_key_(random_token()) {
     if (secure_) {
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
         server_ = std::make_unique<httplib::SSLServer>(certificate.c_str(), key.c_str());
@@ -626,6 +653,7 @@ HttpServer::HttpServer(Session& session, const std::string& certificate, const s
         server_ = std::make_unique<httplib::Server>();
     }
     auto& server = *server_;
+    peer_ = std::make_unique<PeerLink>(session, std::move(changed));
     server.new_task_queue = [] { return new httplib::ThreadPool(8, 8, 32); };
     server.set_payload_max_length(max_file_size);
     server.set_keep_alive_max_count(1);
@@ -641,14 +669,17 @@ HttpServer::HttpServer(Session& session, const std::string& certificate, const s
     });
     const auto auth_cookie = [this] { return "ts_" + std::to_string(port_); };
     const auto auth = [auth_cookie](const Request& request) {
+        if (request.has_header("X-Desktop-Key")) return request.get_header_value("X-Desktop-Key");
         return cookie_token(request, auth_cookie());
     };
 
     server.set_pre_request_handler([this](const Request& request, Response& response) {
         using Result = httplib::Server::HandlerResponse;
         const bool loopback = local_socket(request);
+        const bool gateway = request.local_addr == "127.0.0.1" && request.remote_addr == "127.0.0.1" &&
+            request.get_header_value("X-Gateway-Key") == gateway_key_;
         const auto interfaces = networks();
-        if (!loopback && !permits_private_lan_peer(interfaces, request.local_addr, request.remote_addr)) {
+        if (!gateway && !loopback && !permits_private_lan_peer(interfaces, request.local_addr, request.remote_addr)) {
             fail(response, 403, "Private LAN address required");
             return Result::Handled;
         }
@@ -657,6 +688,14 @@ HttpServer::HttpServer(Session& session, const std::string& certificate, const s
         if (host != request.local_addr && !(loopback && host == "localhost")) {
             fail(response, 400, "Open the IPv4 address shown in TempShare");
             return Result::Handled;
+        }
+        if (request.method == "GET" && request.path == "/" && session_.snapshot(SnapshotPage::home).pairing &&
+            !session_.pairing(cookie_token(request, "ts_" + std::to_string(port_)))) {
+            const auto route = available_session();
+            if (!route.empty()) {
+                response.set_redirect(route + "/");
+                return Result::Handled;
+            }
         }
         if (request.method != "GET" && request.method != "HEAD" && request.get_header_value("X-TempShare") != "1") {
             fail(response, 403, "Request header missing");
@@ -669,6 +708,8 @@ HttpServer::HttpServer(Session& session, const std::string& certificate, const s
             path.substr(upload_prefix.size()).find_first_not_of("0123456789abcdef") == std::string_view::npos;
         if (!upload) {
             std::size_t limit = 0;
+            if (path.substr(0, 3) == "/s/") limit = 4 * 1024 * 1024;
+            if (path.substr(0, 10) == "/peer/api/") limit = 4 * 1024 * 1024;
             if (request.method == "POST" && path == "/api/text") limit = max_text_size;
             if (request.method == "POST" && (path == "/api/cast/offer" || path == "/api/cast/answer")) {
                 limit = max_sdp_size;
@@ -691,6 +732,16 @@ HttpServer::HttpServer(Session& session, const std::string& certificate, const s
     });
 
     register_pages(server);
+    const auto gateway_handler = [this](const Request& request, Response& response) { forward_session(request, response); };
+    server.Get(R"(/s/([1-4])(/.*)?)", gateway_handler);
+    server.Post(R"(/s/([1-4])(/.*)?)", gateway_handler);
+    server.Put(R"(/s/([1-4])(/.*)?)", gateway_handler);
+    server.Delete(R"(/s/([1-4])(/.*)?)", gateway_handler);
+    server.Get("/peer", [](const Request& request, Response& response) {
+        if (!local_socket(request)) return fail(response, 403, "Local desktop authorization required");
+        response.set_content(web::index, "text/html; charset=utf-8");
+    });
+    peer_->register_routes(server);
     register_pairing(server, session, secure_, auth_cookie, auth);
     register_cast(server, session, auth);
     register_transfers(server, session, auth);
@@ -714,16 +765,23 @@ bool HttpServer::start(unsigned short preferred_port, bool loopback) {
         server_->decommission();
     });
     server_->wait_until_ready();
+    if (server_->is_running()) peer_->start(port_, secure_, loopback);
     return server_->is_running();
 }
 
 void HttpServer::stop() {
+    if (peer_) peer_->stop();
     if (server_) server_->stop();
     if (thread_.joinable()) thread_.join();
 }
 
+PeerLink& HttpServer::peer() { return *peer_; }
+const PeerLink& HttpServer::peer() const { return *peer_; }
+
 std::string HttpServer::url(const std::string& address) const {
-    return std::string(secure_ ? "https://" : "http://") + address + ':' + std::to_string(port_) + '/';
+    std::lock_guard lock(networks_mutex_);
+    return std::string(secure_ ? "https://" : "http://") + address + ':' +
+        std::to_string(public_port_ ? public_port_ : port_) + public_route_ + '/';
 }
 
 bool HttpServer::probe(const std::string& address) const {
@@ -751,6 +809,100 @@ bool HttpServer::update_networks(std::vector<LocalNetwork> networks) {
     if (networks_ == networks) return false;
     networks_ = std::move(networks);
     return true;
+}
+
+
+void HttpServer::configure_gateway(const std::vector<HttpServer*>& sessions) {
+    {
+        std::lock_guard lock(networks_mutex_);
+        routes_ = sessions;
+    }
+    for (std::size_t index = 0; index < sessions.size(); ++index) {
+        auto* target = sessions[index];
+        const auto route = index ? "/s/" + std::to_string(index + 1) : std::string{};
+        {
+            std::lock_guard lock(target->networks_mutex_);
+            target->public_port_ = port_;
+            target->public_route_ = route;
+        }
+        target->peer().set_public_endpoint(port_, route);
+        target->peer().set_admission([this] { return available_session(); });
+    }
+}
+
+std::string HttpServer::available_session() {
+    std::vector<HttpServer*> routes;
+    { std::lock_guard lock(networks_mutex_); routes = routes_; }
+    for (std::size_t index = 0; index < routes.size(); ++index) {
+        const auto state = routes[index]->session_.snapshot(SnapshotPage::home);
+        if (!state.pairing && !routes[index]->peer().snapshot().attached) {
+            if (!state.active) routes[index]->session_.start();
+            return "/s/" + std::to_string(index + 1);
+        }
+    }
+    return {};
+}
+
+void HttpServer::forward_session(const Request& request, Response& response) {
+    const auto index = static_cast<std::size_t>(request.matches[1].str()[0] - '1');
+    HttpServer* target = nullptr;
+    { std::lock_guard lock(networks_mutex_); if (index < routes_.size()) target = routes_[index]; }
+    if (!target) return fail(response, 404, "Session route unavailable");
+    std::string path = request.target.substr(4);
+    if (path.empty()) path = "/";
+    if (path.front() != '/') return fail(response, 400, "Invalid session route");
+    const auto origin = std::string(target->secure_ ? "https://" : "http://") + "127.0.0.1:" + std::to_string(target->port_);
+    auto headers = request.headers;
+    headers.erase("Host"); headers.erase("Content-Length"); headers.erase("Transfer-Encoding");
+    headers.erase("X-Gateway-Key"); headers.erase("X-LAN-Source"); headers.erase("X-LAN-Local");
+    headers.emplace("X-Gateway-Key", target->gateway_key_);
+    headers.emplace("X-LAN-Source", request.remote_addr);
+    headers.emplace("X-LAN-Local", request.local_addr);
+    auto prepare = [origin] {
+        auto remote = std::make_unique<httplib::Client>(origin);
+        remote->set_connection_timeout(2); remote->set_read_timeout(10); remote->set_write_timeout(10);
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        remote->enable_server_certificate_verification(false); // 仅连接本进程的回环服务。
+#endif
+        return remote;
+    };
+    auto remote = prepare();
+    const bool stream = request.method == "GET" && (path.find("/download/") != std::string::npos ||
+        path.find("/attachment/") != std::string::npos || path.find("/zip/") != std::string::npos);
+    if (stream) {
+        const auto head = remote->Head(path, headers);
+        if (!head || head->status >= 400) return fail(response, head ? head->status : 502, "Download unavailable");
+        response.status = head->status;
+        for (const auto* name : {"Content-Disposition", "Content-Type", "Content-Range", "Accept-Ranges"})
+            if (head->has_header(name)) response.set_header(name, head->get_header_value(name));
+        response.set_chunked_content_provider(head->get_header_value("Content-Type"),
+            [prepare, path, headers](std::size_t, httplib::DataSink& sink) {
+                auto input = prepare();
+                const auto result = input->Get(path, headers,
+                    [](const Response& item) { return item.status >= 200 && item.status < 300; },
+                    [&](const char* data, std::size_t size) { return sink.write(data, size); });
+                if (!result) return false;
+                sink.done(); return true;
+            });
+        return;
+    }
+    Request outbound;
+    outbound.method = request.method; outbound.path = path; outbound.headers = headers; outbound.body = request.body;
+    std::string body;
+    outbound.content_receiver = [&](const char* data, std::size_t size, std::uint64_t, std::uint64_t) {
+        if (size > 4 * 1024 * 1024 - body.size()) return false;
+        body.append(data, size); return true;
+    };
+    const auto result = remote->send(outbound);
+    if (!result) return fail(response, 502, "Session unavailable");
+    response.status = result->status;
+    response.set_content(body, result->get_header_value("Content-Type"));
+    for (const auto* name : {"Set-Cookie", "Location", "X-Desktop-Route", "X-Offer-ID", "Content-Disposition",
+                             "Content-Range", "Accept-Ranges", "Retry-After", "X-Cast-Sequence"})
+        for (std::size_t i = 0; i < result->get_header_value_count(name); ++i)
+            response.set_header(name, result->get_header_value(name, "", i));
+    if (request.method == "HEAD" && result->has_header("Content-Length"))
+        response.set_header("Content-Length", result->get_header_value("Content-Length"));
 }
 
 }  // namespace tempshare

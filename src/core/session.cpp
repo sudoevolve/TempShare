@@ -128,7 +128,7 @@ bool save_trusted_device(const std::filesystem::path& directory, const TrustedDe
     pending += ".new";
     std::ofstream output(pending, std::ios::binary | std::ios::trunc);
     const auto& permissions = device.permissions;
-    output << permissions.download << permissions.upload << permissions.text << '\n' << device.name << '\n';
+    output << permissions.download << permissions.upload << permissions.text << permissions.cast << '\n' << device.name << '\n';
     output.close();
     std::error_code error;
     if (output) std::filesystem::rename(pending, target, error);
@@ -276,9 +276,10 @@ Session::Session(std::filesystem::path directory, std::function<void()> changed,
         std::ifstream input(entry->path(), std::ios::binary);
         std::string flags;
         std::string name;
-        if (std::getline(input, flags) && std::getline(input, name) && flags.size() == 3 &&
+        if (std::getline(input, flags) && std::getline(input, name) && (flags.size() == 3 || flags.size() == 4) &&
             flags.find_first_not_of("01") == std::string::npos && valid_filename(name)) {
-            trusted_.push_back({key, std::move(name), {flags[0] == '1', flags[1] == '1', flags[2] == '1'}});
+            trusted_.push_back({key, std::move(name), {flags[0] == '1', flags[1] == '1', flags[2] == '1',
+                                flags.size() == 4 && flags[3] == '1'}});
         }
     }
 }
@@ -314,7 +315,16 @@ bool Session::clear_received() {
     return true;
 }
 
-bool Session::active() const { return Clock::now() < expires_; }
+bool Session::active() const {
+    const auto now = Clock::now();
+    if (now < expires_) return true;
+    if (expires_ == Clock::time_point{} || now - progress_at_ >= std::chrono::seconds(30)) return false;
+    return (!cast_token_.empty() && cast_.ready) || std::any_of(downloads_.begin(), downloads_.end(), [](const DownloadActivity& transfer) {
+        return !transfer.finished;
+    }) || std::any_of(offers_.begin(), offers_.end(), [](const Offer& offer) {
+        return offer.state == State::uploading || (offer.state == State::approved && offer.transferred != 0);
+    });
+}
 
 bool Session::has_access(std::string_view token) const {
     return active() && pairing_ && pairing_->state == State::approved && equals(token, pairing_->token);
@@ -338,6 +348,7 @@ void Session::reset_content() {
     if (pairing_) previous_pairing_.swap(pairing_->token);
     pairing_.reset();
     offers_.clear();
+    downloads_.clear();
     ++offers_revision_;
     committed_bytes_ = 0;
     partials_.clear();
@@ -346,6 +357,7 @@ void Session::reset_content() {
     ++files_revision_;
     staging_.clear();
     messages_.clear();
+    messages_cleared_.clear();
     ++text_revision_;
     cast_token_.clear();
     reset_cast_signal();
@@ -372,6 +384,20 @@ bool Session::extend() {
 bool Session::expire() {
     Notification notification{changed_};
     std::lock_guard lock(mutex_);
+    if (!trust_directory_.empty()) {
+        const auto removed = std::remove_if(trusted_.begin(), trusted_.end(), [&](const TrustedDevice& device) {
+            std::error_code error;
+            return !std::filesystem::exists(trust_directory_ / device.key, error) && !error;
+        });
+        if (removed != trusted_.end()) { trusted_.erase(removed, trusted_.end()); notification.changed = true; }
+        if (pairing_ && !pairing_->trusted_key.empty()) {
+            std::error_code error;
+            if (!std::filesystem::exists(trust_directory_ / pairing_->trusted_key, error) && !error) {
+                reset_content(); invitation_ = random_token(); code_ = short_code(code_);
+                notification.changed = true;
+            }
+        }
+    }
     if (active() && pairing_ && pairing_->state == State::pending && Clock::now() >= pairing_deadline_) {
         previous_pairing_ = std::move(pairing_->token);
         previous_pairing_error_ = "approval_expired";
@@ -411,12 +437,15 @@ Snapshot Session::snapshot(SnapshotPage page) const {
     result.remaining_seconds = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::seconds>(expires_ - Clock::now()).count());
     result.invitation = invitation_;
     result.code = code_;
+    result.messages_cleared = messages_cleared_;
     result.pairing = pairing_;
+    if (result.pairing) result.pairing->online = Clock::now() - peer_seen_ < std::chrono::seconds(12);
     if (result.pairing && result.pairing->state == State::pending) {
         result.pairing->remaining_seconds = std::max<std::int64_t>(0,
             std::chrono::ceil<std::chrono::seconds>(pairing_deadline_ - Clock::now()).count());
     }
     if (page == SnapshotPage::all || page == SnapshotPage::share) {
+        result.downloads = downloads_;
         result.offers = offers_;
         result.shared = shared_;
     } else {
@@ -627,6 +656,7 @@ std::optional<Pairing> Session::pair(std::string_view invitation, std::string na
     if (!valid_filename(name) || name.size() > 80) name = "浏览器";
     pairing_ = Pairing{random_token(), short_code(), State::pending, std::move(name), {}};
     pairing_deadline_ = Clock::now() + std::chrono::minutes(2);
+    peer_seen_ = Clock::now();
     notification.changed = true;
     return pairing_;
 }
@@ -635,12 +665,20 @@ std::optional<Pairing> Session::reconnect(std::string_view trusted) {
     Notification notification{changed_};
     std::lock_guard lock(mutex_);
     if (!active() || pairing_ || trust_directory_.empty()) return {};
-    const auto device = std::find_if(trusted_.begin(), trusted_.end(), [trusted](const TrustedDevice& entry) {
+    if (trusted.size() != 32 || trusted.find_first_not_of("0123456789abcdef") != std::string_view::npos) return {};
+    std::ifstream input(trust_directory_ / std::string(trusted), std::ios::binary);
+    std::string flags, name;
+    if (!std::getline(input, flags) || !std::getline(input, name) || (flags.size() != 3 && flags.size() != 4) ||
+        flags.find_first_not_of("01") != std::string::npos || !valid_filename(name)) return {};
+    const TrustedDevice stored{std::string(trusted), name, {flags[0] == '1', flags[1] == '1', flags[2] == '1', flags.size() == 4 && flags[3] == '1'}};
+    auto device = std::find_if(trusted_.begin(), trusted_.end(), [trusted](const TrustedDevice& entry) {
         return equals(trusted, entry.key);
     });
-    if (device == trusted_.end()) return {};
+    if (device == trusted_.end()) { trusted_.push_back(stored); device = std::prev(trusted_.end()); }
+    else *device = stored;
     permissions_ = device->permissions;
     pairing_ = Pairing{random_token(), {}, State::approved, device->name, device->key};
+    peer_seen_ = Clock::now();
     notification.changed = true;
     return pairing_;
 }
@@ -696,6 +734,7 @@ std::optional<Pairing> Session::pairing(std::string_view token) const {
     std::lock_guard lock(mutex_);
     if (!active() || !pairing_ || !equals(token, pairing_->token)) return {};
     auto result = *pairing_;
+    result.online = Clock::now() - peer_seen_ < std::chrono::seconds(12);
     result.remaining_seconds = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::seconds>(expires_ - Clock::now()).count());
     if (result.state == State::pending) result.remaining_seconds = std::max<std::int64_t>(0,
         std::chrono::ceil<std::chrono::seconds>(pairing_deadline_ - Clock::now()).count());
@@ -739,9 +778,16 @@ bool Session::disconnect(std::string_view token) {
         invitation_ = random_token();
         code_ = short_code(code_);
     } else {
-        expires_ = {};
-        previous_pairing_error_ = "session_ended";
-        reset_content();
+        previous_pairing_ = std::move(pairing_->token);
+        previous_pairing_error_ = "device_left";
+        pairing_.reset();
+        for (auto& offer : offers_) if (offer.state != State::complete) offer.state = State::rejected;
+        partials_.clear();
+        ++offers_revision_;
+        cast_token_.clear();
+        reset_cast_signal();
+        invitation_ = random_token();
+        code_ = short_code(code_);
     }
     notification.changed = true;
     return true;
@@ -750,6 +796,93 @@ bool Session::disconnect(std::string_view token) {
 bool Session::authorized(std::string_view token) const {
     std::lock_guard lock(mutex_);
     return has_access(token);
+}
+
+bool Session::touch(std::string_view token) {
+    std::lock_guard lock(mutex_);
+    if (!active() || !pairing_ || !equals(token, pairing_->token)) return false;
+    peer_seen_ = Clock::now();
+    return true;
+}
+
+bool Session::receive_peer_message(std::string_view token, const Message& message) {
+    Notification notification{changed_};
+    std::lock_guard lock(mutex_);
+    if (!has_access(token) || !add_message(message.text, false)) return false;
+    messages_.back().attachment = message.attachment;
+    messages_.back().remote_attachment = !message.attachment.empty();
+    messages_.back().sent_at = message.sent_at;
+    notification.changed = true;
+    return true;
+}
+
+bool Session::record_peer_sent(std::string_view token, const std::string& text) {
+    Notification notification{changed_};
+    std::lock_guard lock(mutex_);
+    if (!has_access(token) || !add_message(text, true)) return false;
+    messages_.back().local_only = true;
+    notification.changed = true;
+    return true;
+}
+
+void Session::merge_peer_clear(std::string_view token, const std::string& mark) {
+    if (mark.empty() || mark.size() > 80 || mark.find_first_not_of("0123456789abcdef:") != std::string::npos) return;
+    Notification notification{changed_};
+    std::lock_guard lock(mutex_);
+    if (!has_access(token)) return;
+    if (mark <= messages_cleared_) return;
+    messages_cleared_ = mark;
+    messages_.clear();
+    ++text_revision_;
+    notification.changed = true;
+}
+
+bool Session::record_download(const std::filesystem::path& path, const std::string& sender) {
+    const auto source = SharedSource(path).version();
+    if (!source) return false;
+    Notification notification{changed_};
+    std::lock_guard lock(mutex_);
+    File file{random_token(), path.filename().u8string(), source->size, path, source};
+    file.received_from = sender;
+    file.received_at = unix_seconds();
+    received_.push_back(std::move(file));
+    const bool saved = save_received();
+    notification.changed = true;
+    return saved;
+}
+
+void Session::download_progress(const std::string& id, const std::string& name, std::uint64_t size, std::uint64_t sent) {
+    Notification notification{changed_};
+    std::lock_guard lock(mutex_);
+    if (!active()) return;
+    progress_at_ = Clock::now();
+    auto found = std::find_if(downloads_.begin(), downloads_.end(), [&](const DownloadActivity& item) { return item.id == id; });
+    if (found == downloads_.end()) {
+        if (downloads_.size() >= 100) {
+            const auto old = std::find_if(downloads_.begin(), downloads_.end(), [](const DownloadActivity& item) { return item.finished; });
+            if (old != downloads_.end()) downloads_.erase(old);
+        }
+        downloads_.push_back({id, name, size, sent}); notification.changed = true;
+    } else {
+        notification.changed = sent / (512 * 1024) != found->transferred / (512 * 1024);
+        found->transferred = sent;
+    }
+}
+
+void Session::download_finished(const std::string& id, bool success) {
+    Notification notification{changed_};
+    std::lock_guard lock(mutex_);
+    const auto found = std::find_if(downloads_.begin(), downloads_.end(), [&](const DownloadActivity& item) { return item.id == id; });
+    if (found != downloads_.end()) {
+        found->finished = true; found->success = success;
+        if (success) found->transferred = found->size;
+        notification.changed = true;
+    }
+}
+
+bool Session::cancel_offer(const std::string& id) {
+    const auto state = snapshot(SnapshotPage::home);
+    return state.pairing && cancel_offer(state.pairing->token, id);
 }
 
 bool Session::upload_allowed(std::string_view token) const {
@@ -923,6 +1056,7 @@ std::optional<Upload> Session::begin_upload(std::string_view token, const std::s
     };
     const auto pending = find_offer(offers_, id);
     if (pending == offers_.end() || !matches(*pending)) return {};
+    progress_at_ = Clock::now();
     const auto partial = partials_.find(id);
     const auto existing = partial == partials_.end() ? std::shared_ptr<const std::filesystem::path>{}
                                                      : partial->second.temporary;
@@ -1002,6 +1136,7 @@ bool Session::finish_upload(std::string_view token, const std::string& id, const
     auto offer = find_offer(offers_, id);
     if (offer == offers_.end() || offer->state != State::uploading) return false;
     if (transferred && (*transferred < offer->transferred || *transferred > offer->size)) return false;
+    progress_at_ = Clock::now();
     if (transferred && *transferred < offer->size) {
         offer->transferred = *transferred;
         offer->state = State::approved;
@@ -1044,7 +1179,9 @@ bool Session::uploading(std::string_view token, const std::string& id) const {
     std::lock_guard lock(mutex_);
     if (!has_access(token) || !permissions_.upload) return false;
     const auto offer = find_offer(offers_, id);
-    return offer != offers_.end() && offer->state == State::uploading;
+    if (offer == offers_.end() || offer->state != State::uploading) return false;
+    progress_at_ = Clock::now();
+    return true;
 }
 
 void Session::retry_upload(std::string_view token, const std::string& id) {
@@ -1072,10 +1209,7 @@ void Session::set_permissions(Permissions permissions) {
         }
         partials_.clear();
     }
-    if (!permissions_.text && !messages_.empty()) {
-        messages_.clear();
-        ++text_revision_;
-    }
+    if (!permissions_.cast) { cast_token_.clear(); reset_cast_signal(); }
     notification.changed = true;
 }
 
@@ -1091,6 +1225,7 @@ bool Session::add_message(std::string text, bool from_desktop) {
     }
     if (messages_.size() >= 50) messages_.erase(messages_.begin());
     messages_.push_back({std::move(text), from_desktop, unix_seconds()});
+    messages_.back().sequence = ++message_sequence_;
     ++text_revision_;
     if (!from_desktop) ++incoming_messages_;
     return true;
@@ -1137,6 +1272,7 @@ void Session::clear_messages() {
     Notification notification{changed_};
     std::lock_guard lock(mutex_);
     messages_.clear();
+    messages_cleared_ = std::to_string(unix_seconds()) + ":" + random_token();
     ++text_revision_;
     notification.changed = true;
 }
@@ -1146,6 +1282,7 @@ bool Session::clear_messages(std::string_view token) {
     std::lock_guard lock(mutex_);
     if (!has_access(token) || !permissions_.text) return false;
     messages_.clear();
+    messages_cleared_ = std::to_string(unix_seconds()) + ":" + random_token();
     ++text_revision_;
     notification.changed = true;
     return true;
@@ -1170,10 +1307,11 @@ void Session::reset_cast_signal() {
 std::string Session::open_cast() {
     Notification notification{changed_};
     std::lock_guard lock(mutex_);
-    if (!active() || !pairing_ || pairing_->state != State::approved) return {};
+    if (!active() || !pairing_ || pairing_->state != State::approved || !permissions_.cast) return {};
     cast_token_ = random_token();
     reset_cast_signal();
     cast_host_seen_ = Clock::now();
+    progress_at_ = Clock::now();
     cast_viewer_seen_ = {};
     notification.changed = true;
     return cast_token_;
@@ -1203,6 +1341,7 @@ std::optional<CastSignal> Session::cast_host(std::string_view token) {
         cast_.ready = ready;
         notification.changed = true;
     }
+    if (cast_.ready && cast_.viewing) progress_at_ = Clock::now();
     return cast_;
 }
 
@@ -1211,6 +1350,7 @@ bool Session::cast_ready(std::string_view token) {
     std::lock_guard lock(mutex_);
     if (!cast_host_access(token)) return false;
     cast_host_seen_ = Clock::now();
+    progress_at_ = Clock::now();
     if (!cast_.ready) {
         cast_.ready = true;
         notification.changed = true;
@@ -1228,7 +1368,7 @@ std::optional<CastSignal> Session::cast_viewer(std::string_view token, bool view
                                               bool frames) {
     Notification notification{changed_};
     std::lock_guard lock(mutex_);
-    if (!has_access(token)) return {};
+    if (!has_access(token) || !permissions_.cast) return {};
     if (!viewer.empty() && (viewer.size() != 32 ||
         viewer.find_first_not_of("0123456789abcdef") != std::string_view::npos)) return {};
     if (!cast_available()) return CastSignal{};

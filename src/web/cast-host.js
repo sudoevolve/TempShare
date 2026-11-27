@@ -1,6 +1,12 @@
 import { gather, peerConnection, timedFetch } from './rtc.js';
 
-const key = location.hash.slice(1);
+const mount = location.pathname.match(/^\/s\/[1-4](?=\/|$)/)?.[0] || '';
+const keyStorage = 'tempshare-capture-' + location.pathname;
+let key = location.hash.slice(1);
+try {
+  if (key) sessionStorage.setItem(keyStorage, key);
+  else key = sessionStorage.getItem(keyStorage) || '';
+} catch { /* 存储不可用时仍支持一次性本机授权。 */ }
 if (key) history.replaceState(null, '', location.pathname);
 const byId = (id) => document.getElementById(id);
 const start = byId('start');
@@ -46,7 +52,7 @@ function status(text) {
 
 function host(path = 'host', body, headers = {}) {
   const method = path === 'host' ? 'GET' : 'POST';
-  return timedFetch('/api/cast/' + path, {
+  return timedFetch(mount + '/api/cast/' + path, {
     method, body, cache: 'no-store', keepalive: path === 'stop',
     headers: { 'X-Cast-Key': key, 'X-TempShare': '1', ...headers },
   }, 3500);
@@ -229,6 +235,7 @@ async function tick() {
     if (!response.ok) throw new Error('cast host');
     failures = 0;
     const signal = await response.json();
+    byId('target').textContent = signal.target ? `共享给：${signal.target}` : '';
     const revision = signal.frames ? signal.revision : 0;
     if (revision !== frameRevision) {
       frameRevision = revision;
@@ -246,7 +253,8 @@ async function tick() {
     }
     if (frameRevision) {
       closePeer();
-      status('对方正在使用兼容播放。');
+      status('兼容播放：最高720p、约24fps，无音频；高画质采集选项不会提高兼容传输上限。');
+      byId('transport-info').textContent = `实际兼容发送 ${frameCanvas.width} × ${frameCanvas.height} · 间隔约${frameInterval}ms`;
     } else if (!signal.viewing) {
       closePeer();
       status('等待配对设备开始观看。');
@@ -273,7 +281,7 @@ async function tick() {
 start.addEventListener('click', capture);
 stop.addEventListener('click', () => end('投递已停止。', true));
 window.addEventListener('pagehide', () => {
-  if (!ended) end('', true);
+  if (!ended) end('', false); // 释放本页采集；短期本机会话授权允许刷新后重新选择来源。
 });
 for (const id of ['quality', 'rate']) {
   byId(id).addEventListener('change', () => {
@@ -282,7 +290,10 @@ for (const id of ['quality', 'rate']) {
     applySettings();
   });
 }
-byId('audio').addEventListener('change', savePreferences);
+byId('audio').addEventListener('change', () => {
+  savePreferences();
+  if (stream) byId('audio-info').textContent = '音频选项将在重新选择共享来源后生效。';
+});
 byId('cast-profile').addEventListener('change', (event) => {
   const presets = { smooth: ['720', '60'], clear: ['1440', '30'], original: ['0', '60'] };
   const preset = presets[event.currentTarget.value];
@@ -299,4 +310,47 @@ else if (!navigator.mediaDevices?.getDisplayMedia || typeof RTCPeerConnection ==
   if (!ended && failures === 0) start.disabled = false;
   setInterval(tick, 500);
   setInterval(publishFrame, 12);
+  setInterval(sampleStats, 2000);
+}
+
+let lastStats;
+let samplingStats = false;
+let limitedSamples = 0;
+let nextAdaptation = 0;
+async function sampleStats() {
+  if (!peer || samplingStats) return;
+  samplingStats = true;
+  const current = peer;
+  try {
+    const stats = await current.getStats();
+    if (current !== peer) return;
+    let video;
+    let route;
+    for (const report of stats.values()) {
+      if (report.type === 'outbound-rtp' && report.kind === 'video') video = report;
+      if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) route = report;
+    }
+    if (video) {
+      limitedSamples = video.qualityLimitationReason === 'cpu' || video.qualityLimitationReason === 'bandwidth' ? limitedSamples + 1 : 0;
+      if (limitedSamples >= 3 && Date.now() >= nextAdaptation) {
+        const sender = current.getSenders().find(item => item.track?.kind === 'video');
+        const parameters = sender?.getParameters();
+        const encoding = parameters?.encodings?.[0];
+        if (encoding) {
+          if (video.qualityLimitationReason === 'cpu') encoding.maxFramerate = Math.max(15, Math.round((encoding.maxFramerate || Number(byId('rate').value)) * .8));
+          else encoding.maxBitrate = Math.max(1e6, Math.round((encoding.maxBitrate || 8e6) * .8));
+          try { await sender.setParameters(parameters); } catch { /* 浏览器自动拥塞控制继续生效。 */ }
+          nextAdaptation = Date.now() + 10000; limitedSamples = 0;
+        }
+      }
+      const rate = lastStats && video.timestamp > lastStats.timestamp
+        ? (video.bytesSent - lastStats.bytesSent) * 8 / (video.timestamp - lastStats.timestamp) / 1000 : 0;
+      byId('transport-info').textContent = `实际发送 ${video.frameWidth || '?'} × ${video.frameHeight || '?'} · ${video.framesPerSecond || 0} fps` +
+        (rate ? ` · ${rate.toFixed(1)} Mbps` : '') +
+        (route?.currentRoundTripTime ? ` · RTT ${Math.round(route.currentRoundTripTime * 1000)} ms` : '') +
+        (video.qualityLimitationReason && video.qualityLimitationReason !== 'none' ? ` · 限制：${video.qualityLimitationReason}` : '');
+      lastStats = { timestamp: video.timestamp, bytesSent: video.bytesSent };
+    }
+  } catch { /* 统计失败不打断媒体连接。 */ }
+  finally { samplingStats = false; }
 }

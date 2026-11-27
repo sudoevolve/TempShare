@@ -33,6 +33,7 @@ struct Pairing {
     std::string name;
     std::string trusted_key;
     std::uint64_t remaining_seconds = 0;
+    bool online = false;
 };
 
 struct File {
@@ -62,6 +63,7 @@ struct Permissions {
     bool download = true;
     bool upload = true;
     bool text = true;
+    bool cast = true;
 };
 
 struct TrustedDevice {
@@ -75,6 +77,9 @@ struct Message {
     bool from_desktop;
     std::uint64_t sent_at = 0;
     std::string attachment{};
+    std::uint64_t sequence = 0;
+    bool remote_attachment = false;
+    bool local_only = false;
 };
 
 struct CastSignal {
@@ -89,6 +94,12 @@ struct CastSignal {
 struct CastFrame {
     std::uint64_t sequence = 0;
     std::string jpeg;
+};
+
+struct DownloadActivity {
+    std::string id, name;
+    std::uint64_t size = 0, transferred = 0;
+    bool finished = false, success = false;
 };
 
 struct Snapshot {
@@ -108,6 +119,8 @@ struct Snapshot {
     bool capture_ready = false;
     bool viewer_answered = false;
     bool cast_compatibility = false;
+    std::string messages_cleared;
+    std::vector<DownloadActivity> downloads;
     std::uint64_t remaining_seconds = 0;
     std::size_t pending_transfers = 0;
 };
@@ -159,6 +172,8 @@ public:
     void unshare(const std::string& id);
     bool decide_pairing(const std::string& token, bool accept);
     bool disconnect(std::string_view token);
+    bool touch(std::string_view token);
+    bool cancel_offer(const std::string& id);
     bool decide_offer(const std::string& id, bool accept);
     std::size_t decide_offers(const std::vector<std::string>& ids, bool accept);
     void set_permissions(Permissions permissions);
@@ -170,6 +185,12 @@ public:
     std::uint64_t text_revision() const;
     void clear_messages();
     bool clear_messages(std::string_view token);
+    bool receive_peer_message(std::string_view token, const Message& message);
+    bool record_peer_sent(std::string_view token, const std::string& text);
+    void merge_peer_clear(std::string_view token, const std::string& mark);
+    bool record_download(const std::filesystem::path& path, const std::string& sender);
+    void download_progress(const std::string& id, const std::string& name, std::uint64_t size, std::uint64_t sent);
+    void download_finished(const std::string& id, bool success);
 
     std::string open_cast();
     bool stop_cast(std::string_view token = {});
@@ -229,6 +250,8 @@ private:
     Clock::time_point expires_{};
     Clock::time_point retry_after_{};
     Clock::time_point pairing_deadline_{};
+    Clock::time_point peer_seen_{};
+    mutable Clock::time_point progress_at_{};
     unsigned failed_codes_ = 0;
     std::string invitation_;
     std::string code_;
@@ -257,6 +280,9 @@ private:
     std::vector<Message> messages_;
     std::uint64_t text_revision_ = 0;
     std::uint64_t incoming_messages_ = 0;
+    std::uint64_t message_sequence_ = 0;
+    std::string messages_cleared_;
+    std::vector<DownloadActivity> downloads_;
     std::string cast_token_;
     CastSignal cast_;
     CastFrame cast_frame_;

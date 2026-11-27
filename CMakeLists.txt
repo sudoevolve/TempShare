@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(TempShare VERSION 0.3.0 LANGUAGES C CXX)
+project(TempShare VERSION 0.4.0 LANGUAGES C CXX)
 
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -25,6 +25,53 @@ FetchContent_Declare(miniz
     GIT_REPOSITORY https://github.com/richgel999/miniz.git
     GIT_TAG 174573d60290f447c13a2b1b3405de2b96e27d6c)
 FetchContent_MakeAvailable(aino httplib qrcode miniz)
+# 固定 Aino 提交的最小关闭请求钩子。所有替换必须命中；上游变化时配置失败，避免静默丢失退出确认。
+file(READ "${aino_SOURCE_DIR}/aino.hpp" tempshare_aino)
+function(tempshare_aino_replace before after)
+    string(FIND "${tempshare_aino}" "${before}" position)
+    if(position EQUAL -1)
+        message(FATAL_ERROR "Pinned Aino close hook no longer matches its source")
+    endif()
+    string(REPLACE "${before}" "${after}" tempshare_aino "${tempshare_aino}")
+    set(tempshare_aino "${tempshare_aino}" PARENT_SCOPE)
+endfunction()
+tempshare_aino_replace(
+    "    bool should_close() const;"
+    "    void set_close_handler(std::function<void()> callback);\n    bool should_close() const;")
+tempshare_aino_replace(
+    "    std::atomic<bool> running{true};"
+    "    std::function<void()> close_handler;\n    bool request_close() {\n        if (close_handler) { close_handler(); need_frame = true; wake_signal.notify(); return false; }\n        running = false; wake_signal.notify(); return true;\n    }\n    std::atomic<bool> running{true};")
+tempshare_aino_replace(
+    "bool  Window::should_close() const"
+    "void Window::set_close_handler(std::function<void()> callback) { impl->close_handler = std::move(callback); }\nbool  Window::should_close() const")
+tempshare_aino_replace(
+    "case WM_CLOSE:\n        // WM_QUIT 属于整个线程；关闭本窗口不能结束同线程的其它窗口。\n        s->owner->running = false;"
+    "case WM_CLOSE:\n        s->owner->request_close();")
+tempshare_aino_replace(
+    "if (Atom(e.xclient.data.l[0]) == s->wm_delete) { o->running = false; return false; }"
+    "if (Atom(e.xclient.data.l[0]) == s->wm_delete) { if (o->request_close()) return false; break; }")
+tempshare_aino_replace(
+    "if (s->title_pressed == 1) s->owner->running = false;"
+    "if (s->title_pressed == 1) s->owner->request_close();")
+tempshare_aino_replace(
+    "[](void* data, wl::Proxy*) { static_cast<WaylandState*>(data)->owner->running = false; }"
+    "[](void* data, wl::Proxy*) { static_cast<WaylandState*>(data)->owner->request_close(); }")
+tempshare_aino_replace(
+    "inline void cocoa_window_closed(id self, SEL, id) {"
+    "inline BOOL cocoa_window_should_close(id self, SEL, id) {\n    if (auto* s = cocoa_state_of(self)) return s->owner->request_close() ? YES : NO;\n    return YES;\n}\ninline void cocoa_window_closed(id self, SEL, id) {")
+tempshare_aino_replace(
+    "class_addMethod(view_cls, sel_registerName(\"windowWillClose:\"), reinterpret_cast<IMP>(cocoa_window_closed), \"v@:@\");"
+    "class_addMethod(view_cls, sel_registerName(\"windowShouldClose:\"), reinterpret_cast<IMP>(cocoa_window_should_close), \"c@:@\");\n        class_addMethod(view_cls, sel_registerName(\"windowWillClose:\"), reinterpret_cast<IMP>(cocoa_window_closed), \"v@:@\");")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/aino")
+set(tempshare_aino_path "${CMAKE_CURRENT_BINARY_DIR}/generated/aino/aino.hpp")
+if(EXISTS "${tempshare_aino_path}")
+    file(READ "${tempshare_aino_path}" tempshare_previous_aino)
+endif()
+if(NOT tempshare_aino STREQUAL tempshare_previous_aino)
+    file(WRITE "${tempshare_aino_path}" "${tempshare_aino}")
+endif()
+unset(tempshare_aino)
+unset(tempshare_previous_aino)
 target_compile_definitions(miniz PRIVATE MINIZ_NO_ZLIB_COMPATIBLE_NAMES)
 
 foreach(asset IN ITEMS index.html styles.css app.js appearance.js cast.html cast-host.js rtc.js resume.js)
@@ -39,7 +86,7 @@ string(REGEX REPLACE "(..)" "0x\\1," icon_bytes "${icon_hex}")
 configure_file(src/core/web_assets.hpp.in generated/web_assets.hpp @ONLY)
 
 add_library(tempshare_core STATIC src/core/session.cpp src/core/http_server.cpp src/core/discovery.cpp
-    src/core/folder_archive.cpp src/core/shared_source.cpp)
+    src/core/folder_archive.cpp src/core/shared_source.cpp src/core/peer_link.cpp)
 target_compile_features(tempshare_core PUBLIC cxx_std_17)
 target_include_directories(tempshare_core PUBLIC src PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_include_directories(tempshare_core SYSTEM PRIVATE "${httplib_SOURCE_DIR}")
@@ -56,6 +103,7 @@ endif()
 add_executable(tempshare src/client/main.cpp src/client/platform.cpp "${qrcode_SOURCE_DIR}/cpp/qrcodegen.cpp")
 target_compile_definitions(tempshare PRIVATE TEMPSHARE_VERSION="${PROJECT_VERSION}")
 target_include_directories(tempshare SYSTEM PRIVATE "${aino_SOURCE_DIR}" "${qrcode_SOURCE_DIR}/cpp")
+target_include_directories(tempshare SYSTEM BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/aino")
 target_link_libraries(tempshare PRIVATE tempshare_core Threads::Threads)
 
 if(WIN32)
@@ -87,13 +135,19 @@ endforeach()
 
 install(TARGETS tempshare RUNTIME DESTINATION bin)
 install(FILES LICENSE README.md DESTINATION share/tempshare)
-install(FILES docs/http-api.md docs/lan-https.md docs/ux-review.md DESTINATION share/tempshare/docs)
+install(FILES docs/http-api.md docs/lan-https.md docs/ux-review.md docs/lan-interconnection-review.md
+    DESTINATION share/tempshare/docs)
 install(FILES "${aino_SOURCE_DIR}/LICENSE" DESTINATION share/tempshare/licenses RENAME aino.txt)
 install(FILES "${httplib_SOURCE_DIR}/LICENSE" DESTINATION share/tempshare/licenses RENAME cpp-httplib.txt)
 install(FILES "${qrcode_SOURCE_DIR}/Readme.markdown" DESTINATION share/tempshare/licenses RENAME QR-Code-generator.txt)
 install(FILES "${miniz_SOURCE_DIR}/LICENSE" DESTINATION share/tempshare/licenses RENAME miniz.txt)
 
 if(BUILD_TESTING)
+    add_executable(tempshare_browser_fixture tests/browser_fixture.cpp)
+    target_link_libraries(tempshare_browser_fixture PRIVATE tempshare_core Threads::Threads)
+    if(MSVC)
+        target_compile_options(tempshare_browser_fixture PRIVATE /utf-8)
+    endif()
     add_executable(tempshare_integration tests/integration.cpp)
     target_include_directories(tempshare_integration SYSTEM PRIVATE "${httplib_SOURCE_DIR}")
     target_link_libraries(tempshare_integration PRIVATE tempshare_core Threads::Threads)
@@ -104,7 +158,7 @@ if(BUILD_TESTING)
         target_compile_options(tempshare_integration PRIVATE /utf-8)
     endif()
     add_test(NAME share_roundtrip COMMAND tempshare_integration)
-    set_tests_properties(share_roundtrip PROPERTIES TIMEOUT 30)
+    set_tests_properties(share_roundtrip PROPERTIES TIMEOUT 60)
     if(WIN32)
         add_test(NAME desktop_gui_subsystem COMMAND
             powershell -NoProfile -Command "& { param([string]$exe) $b=[IO.File]::ReadAllBytes($exe); $pe=[BitConverter]::ToInt32($b,60); if ([BitConverter]::ToUInt16($b,$pe+92) -ne 2) { exit 1 } }" "$<TARGET_FILE:tempshare>")

@@ -1,4 +1,6 @@
 #include "core/discovery.hpp"
+#include "core/session.hpp"
+#include <httplib.h>
 
 #include <algorithm>
 #include <charconv>
@@ -15,6 +17,7 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <netdb.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -55,8 +58,8 @@ struct Datagram {
     }
 
     template<typename Value>
-    void option(int level, int name, const Value& value) const {
-        setsockopt(fd, level, name, reinterpret_cast<const char*>(&value), sizeof(value));
+    bool option(int level, int name, const Value& value) const {
+        return setsockopt(fd, level, name, reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
     }
 };
 
@@ -95,8 +98,19 @@ std::string hostname() {
 }
 
 std::optional<Peer> announcement(std::string_view packet, std::string address) {
-    if (packet.substr(0, protocol.size()) != protocol) return {};
-    packet.remove_prefix(protocol.size());
+    std::string identity;
+    const bool modern = packet.substr(0, 12) == "TempShare/2 ";
+    if (modern) {
+        packet.remove_prefix(12);
+        if (packet.size() < 33 || packet[32] != ' ') return {};
+        identity = std::string(packet.substr(0, 32));
+        if (identity.find_first_not_of("0123456789abcdef") != std::string::npos) return {};
+        packet.remove_prefix(33);
+    }
+    if (!modern) {
+        if (packet.substr(0, protocol.size()) != protocol) return {};
+        packet.remove_prefix(protocol.size());
+    }
     const auto gap = packet.find(' ');
     if (gap == std::string_view::npos) return {};
     unsigned short port = 0;
@@ -111,11 +125,14 @@ std::optional<Peer> announcement(std::string_view packet, std::string address) {
     if (name_start == std::string_view::npos) return {};
     const auto os = packet.substr(0, name_start);
     const auto name = packet.substr(name_start + 1);
-    if ((os != "Windows" && os != "macOS" && os != "Linux") || name.empty() || name.size() > 63 ||
+    if ((os != "Windows" && os != "macOS" && os != "Linux") || name.empty() || name.size() > (modern ? 240u : 63u) ||
         !std::all_of(name.begin(), name.end(), [](unsigned char c) { return c >= 32 && c <= 126; })) {
         return {};
     }
-    return Peer{std::move(address), port, std::string(name), std::string(os), secure};
+    auto decoded = modern ? httplib::decode_uri(std::string(name)) : std::string(name);
+    if (!valid_filename(decoded) || decoded.size() > 80) return {};
+    Peer peer{address, port, std::move(decoded), std::string(os), secure, identity, {address}};
+    return peer;
 }
 
 }  // namespace
@@ -136,6 +153,20 @@ bool LocalNetwork::contains(const std::string& other) const {
 bool is_private_ipv4(const std::string& address) {
     in_addr native{};
     return inet_pton(AF_INET, address.c_str(), &native) == 1 && private_address(ntohl(native.s_addr));
+}
+
+std::vector<std::string> resolve_lan_addresses(const std::string& name) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    addrinfo* addresses = nullptr;
+    if (getaddrinfo(name.c_str(), nullptr, &hints, &addresses) != 0) return {};
+    std::vector<std::string> result;
+    for (auto* item = addresses; item; item = item->ai_next) {
+        const auto address = format_address(reinterpret_cast<sockaddr_in*>(item->ai_addr)->sin_addr);
+        if (is_private_ipv4(address) && std::find(result.begin(), result.end(), address) == result.end()) result.push_back(address);
+    }
+    freeaddrinfo(addresses);
+    return result;
 }
 
 std::vector<LocalNetwork> lan_networks() {
@@ -242,9 +273,12 @@ bool permits_private_lan_peer(const std::vector<LocalNetwork>& interfaces,
 }
 
 Discovery::Discovery(unsigned short port, bool secure, std::function<std::vector<LocalNetwork>()> networks,
-                     std::function<void()> changed)
+                     std::function<void()> changed, std::string identity, std::string name)
     : port_(port), secure_(secure), networks_(std::move(networks)),
-      changed_(std::move(changed)), worker_(&Discovery::run, this) {}
+      changed_(std::move(changed)), id_(identity.empty() ? random_token() : std::move(identity)),
+      name_(name.empty() ? hostname() : std::move(name)) {
+    worker_ = std::thread(&Discovery::run, this);
+}
 
 Discovery::~Discovery() {
     running_ = false;
@@ -255,6 +289,7 @@ std::vector<Peer> Discovery::peers() const {
     std::lock_guard lock(mutex_);
     std::vector<Peer> result;
     for (const auto& item : peers_) result.push_back(item.peer);
+    std::sort(result.begin(), result.end(), [](const Peer& a, const Peer& b) { return a.name < b.name; });
     return result;
 }
 
@@ -262,6 +297,7 @@ void Discovery::run() {
     while (running_) {
         const auto networks = networks_();
         if (!networks.empty()) announce(networks);
+        else { std::lock_guard lock(mutex_); status_ = "没有可用的局域网，请检查网络连接"; }
         if (!running_) break;
         bool changed = false;
         {
@@ -276,7 +312,7 @@ void Discovery::run() {
 
 void Discovery::announce(const std::vector<LocalNetwork>& networks) {
     Datagram socket;
-    if (socket.fd == invalid_socket) return;
+    if (socket.fd == invalid_socket) { std::lock_guard lock(mutex_); status_ = "无法创建发现服务"; return; }
     socket.option(SOL_SOCKET, SO_REUSEADDR, 1);
 #ifndef _WIN32
 #ifdef SO_REUSEPORT
@@ -287,22 +323,34 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
     sockaddr_in bound{};
     bound.sin_family = AF_INET;
     bound.sin_port = htons(discovery_port);
-    if (bind(socket.fd, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) != 0) return;
+    if (bind(socket.fd, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) != 0) {
+        std::lock_guard lock(mutex_); status_ = "发现端口被占用，可手动粘贴邀请链接"; return;
+    }
 
     sockaddr_in group = bound;
     inet_pton(AF_INET, multicast, &group.sin_addr);
+    unsigned memberships = 0;
     for (const auto& network : networks) {
         ip_mreq membership{};
         membership.imr_multiaddr = group.sin_addr;
         inet_pton(AF_INET, network.address.c_str(), &membership.imr_interface);
-        socket.option(IPPROTO_IP, IP_ADD_MEMBERSHIP, membership);
+        if (socket.option(IPPROTO_IP, IP_ADD_MEMBERSHIP, membership)) ++memberships;
     }
+    if (!memberships) { std::lock_guard lock(mutex_); status_ = "无法加入局域网发现组，请检查网络或粘贴邀请链接"; return; }
 
-    const std::string packet = std::string(protocol) + std::to_string(port_) + (secure_ ? " s " : " h ") +
-                               platform + ' ' + hostname();
+    std::string packet;
+    const auto began = Clock::now();
+    auto last_response = Clock::time_point{};
     auto next_send = Clock::now();
     while (running_ && networks_() == networks) {
         const auto now = Clock::now();
+        {
+            std::lock_guard lock(mutex_);
+            packet = "TempShare/2 " + id_ + ' ' + std::to_string(port_) + (secure_ ? " s " : " h ") +
+                     platform + ' ' + httplib::encode_uri_component(name_);
+            status_ = now - began < std::chrono::seconds(3) ? "正在扫描本地网络" :
+                peers_.empty() ? "扫描完成，未发现设备；可刷新或粘贴地址（跨网段请手动连接）" : "已发现 " + std::to_string(peers_.size()) + " 台设备";
+        }
         if (refresh_.exchange(false) || now >= next_send) {
             for (const auto& network : networks) {
                 in_addr local{};
@@ -310,6 +358,8 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
                 socket.option(IPPROTO_IP, IP_MULTICAST_IF, local);
                 sendto(socket.fd, packet.data(), static_cast<int>(packet.size()), 0,
                        reinterpret_cast<sockaddr*>(&group), sizeof(group));
+                constexpr char query[] = "TempShare/?";
+                sendto(socket.fd, query, sizeof(query) - 1, 0, reinterpret_cast<sockaddr*>(&group), sizeof(group));
             }
             next_send = now + std::chrono::seconds(3);
         }
@@ -325,7 +375,7 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
         const bool readable_socket = poll(&readable, 1, 200) > 0 && (readable.revents & POLLIN);
 #endif
         if (readable_socket) {
-            char incoming[160]{};
+            char incoming[640]{};
             sockaddr_in source{};
             AddressLength size = sizeof(source);
             const auto count = recvfrom(socket.fd, incoming, sizeof(incoming), 0,
@@ -334,17 +384,31 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
             if (count > 0 && std::any_of(networks.begin(), networks.end(), [&](const LocalNetwork& network) {
                 return network.contains(address);
             })) {
+                if (std::string_view(incoming, static_cast<std::size_t>(count)) == "TempShare/?") {
+                    if (now - last_response > std::chrono::milliseconds(300)) {
+                        sendto(socket.fd, packet.data(), static_cast<int>(packet.size()), 0,
+                               reinterpret_cast<sockaddr*>(&source), size);
+                        last_response = now;
+                    }
+                    continue;
+                }
                 auto peer = announcement({incoming, static_cast<std::size_t>(count)}, address);
-                if (peer && (peer->port != port_ || std::none_of(networks.begin(), networks.end(),
+                if (peer && peer->id != id_ && (peer->port != port_ || std::none_of(networks.begin(), networks.end(),
                         [&](const LocalNetwork& network) { return network.address == address; }))) {
                     std::lock_guard lock(mutex_);
                     const auto found = std::find_if(peers_.begin(), peers_.end(), [&](const Seen& seen) {
-                        return seen.peer.address == address && seen.peer.port == peer->port;
+                        return !peer->id.empty() ? seen.peer.id == peer->id :
+                            seen.peer.address == address && seen.peer.port == peer->port;
                     });
                     if (found != peers_.end()) {
                         changed = found->peer.name != peer->name || found->peer.platform != peer->platform ||
-                                  found->peer.secure != peer->secure;
-                        *found = Seen{*peer, now};
+                                  found->peer.secure != peer->secure || found->peer.port != peer->port;
+                        if (std::find(found->peer.addresses.begin(), found->peer.addresses.end(), address) == found->peer.addresses.end()) {
+                            found->peer.addresses.push_back(address); changed = true;
+                        }
+                        found->last = now;
+                        found->peer.name = peer->name; found->peer.secure = peer->secure;
+                        found->peer.platform = peer->platform; found->peer.port = peer->port;
                     } else if (peers_.size() < 64) {
                         peers_.push_back(Seen{*peer, now});
                         changed = true;
@@ -365,5 +429,11 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
 }
 
 void Discovery::refresh() { refresh_ = true; }
+std::string Discovery::status() const { std::lock_guard lock(mutex_); return status_; }
+void Discovery::set_name(std::string name) {
+    if (!valid_filename(name) || name.size() > 80) return;
+    { std::lock_guard lock(mutex_); name_ = std::move(name); }
+    refresh_ = true;
+}
 
 }  // namespace tempshare

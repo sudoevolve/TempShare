@@ -247,22 +247,15 @@ LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT
         desktop.tray = add_tray(window);
         if (!desktop.tray) reveal(window);
     }
-    if (msg == WM_SYSCOMMAND && (wp & 0xfff0) == SC_MINIMIZE && desktop.tray) {
-        desktop.minimize();
-        return 0;
-    }
-    if (msg == WM_CLOSE && !desktop.allow_exit) {
-        if (desktop.close_prompt) return 0;
-        desktop.close_prompt = true;
-        desktop.close_requested = true;
-        InvalidateRect(window, nullptr, FALSE);
-        if (desktop.wake) desktop.wake();
-        return 0;
-    }
     if (msg == tray_message) {
         if (lp == NIN_BALLOONUSERCLICK) {
             desktop.clicked_connection = desktop.notice_connection;
             desktop.clicked_sync = desktop.notice_opens_sync;
+            desktop.clicked_invitation = desktop.notice_invitation;
+        }
+        if (lp == NIN_BALLOONUSERCLICK || lp == NIN_BALLOONTIMEOUT || lp == NIN_BALLOONHIDE) {
+            desktop.notice_active = false;
+            if (desktop.wake) desktop.wake();
         }
         if (lp == WM_LBUTTONUP || lp == NIN_BALLOONUSERCLICK) reveal(window);
         if (lp == WM_RBUTTONUP) {
@@ -283,7 +276,7 @@ LRESULT CALLBACK tray_callback(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT
                 case 1: reveal(window); break;
                 case 2: if (!desktop.inbox.empty()) open_folder(desktop.inbox); break;
                 case 3: desktop.updates(); break;
-                case 4: desktop.allow_exit = true; PostMessageW(window, WM_CLOSE, 0, 0); break;
+                case 4: reveal(window); PostMessageW(window, WM_CLOSE, 0, 0); break;
                 default: break;
                 }
             }
@@ -356,17 +349,28 @@ void DesktopIntegration::minimize() const {
     if (window) ShowWindow(static_cast<HWND>(window), tray ? SW_HIDE : SW_MINIMIZE);
 }
 
-bool DesktopIntegration::notify(const std::wstring& title, const std::wstring& message, int connection, bool open_sync) {
+bool DesktopIntegration::notify(const std::wstring& title, const std::wstring& message, int connection,
+                                const std::string& invitation, bool open_sync) {
     if (!tray) return false;
+    if (notices.size() >= 64) return false;
+    notices.push_back({title, message, connection, invitation, open_sync});
+    return true;
+}
+
+void DesktopIntegration::pump_notifications() {
+    if (!tray || notice_active || notices.empty()) return;
+    const auto& notice = notices.front();
     auto data = tray_data(static_cast<HWND>(window));
     data.uFlags = NIF_INFO;
     data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
-    lstrcpynW(data.szInfoTitle, title.c_str(), ARRAYSIZE(data.szInfoTitle));
-    lstrcpynW(data.szInfo, message.c_str(), ARRAYSIZE(data.szInfo));
-    if (!Shell_NotifyIconW(NIM_MODIFY, &data)) return false;
-    notice_connection = connection;
-    notice_opens_sync = open_sync;
-    return true;
+    lstrcpynW(data.szInfoTitle, notice.title.c_str(), ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, notice.message.c_str(), ARRAYSIZE(data.szInfo));
+    if (!Shell_NotifyIconW(NIM_MODIFY, &data)) return;
+    notice_connection = notice.connection;
+    notice_opens_sync = notice.sync;
+    notice_invitation = notice.invitation;
+    notice_active = true;
+    notices.pop_front();
 }
 
 bool DesktopIntegration::updates() const {
