@@ -462,7 +462,7 @@ void lan_features(const fs::path& path) {
     publish.emplace("X-Cast-Revision", std::to_string(playback->revision));
     const std::string jpeg = "\xff\xd8" "test frame" "\xff\xd9";
     expect(browser.Post("/api/cast/frame", publish, "invalid", "image/jpeg"), 400, "reject malformed frame");
-    expect(browser.Post("/api/cast/frame", publish, std::string(384 * 1024 + 1, 'x'), "image/jpeg"),
+    expect(browser.Post("/api/cast/frame", publish, std::string(tempshare::max_cast_frame_size + 1, 'x'), "image/jpeg"),
            400, "reject oversized frame");
     expect(browser.Post("/api/cast/frame", frame_viewer, jpeg, "image/jpeg"), 403, "viewer cannot publish");
     expect(browser.Post("/api/cast/frame", publish, jpeg, "image/jpeg"), 204, "desktop publishes a frame");
@@ -474,7 +474,21 @@ void lan_features(const fs::path& path) {
     require(frame->body == jpeg, "frame bytes unchanged");
     const auto sequence = frame->get_header_value("X-Cast-Sequence");
     require(!sequence.empty(), "frame has a sequence");
-    read_frame.emplace("X-Cast-After", sequence);
+    const auto previous_sequence = std::stoull(sequence);
+    for (unsigned index = 0; index < 4; ++index) {
+        std::this_thread::sleep_for(12ms);
+        require(session.publish_cast_frame(cast_key, playback->revision, jpeg), "publish high-rate compatibility frame");
+    }
+    const auto high_rate = session.cast_frame(pair->token, viewer, previous_sequence);
+    require(high_rate && high_rate->sequence == previous_sequence + 4, "server no longer discards frames at a 32ms ceiling");
+    std::string detailed_jpeg(512 * 1024, 'x');
+    detailed_jpeg[0] = '\xff'; detailed_jpeg[1] = '\xd8';
+    detailed_jpeg[detailed_jpeg.size() - 2] = '\xff'; detailed_jpeg.back() = '\xd9';
+    std::this_thread::sleep_for(12ms);
+    expect(browser.Post("/api/cast/frame", publish, detailed_jpeg, "image/jpeg"), 204, "accept a detailed frame above the old 384KiB limit");
+    const auto latest = browser.Get("/api/cast/frame", read_frame);
+    expect(latest, 200, "read latest high-rate frame");
+    read_frame.emplace("X-Cast-After", latest->get_header_value("X-Cast-Sequence"));
     auto wait_frame = read_frame;
     wait_frame.emplace("X-Cast-Wait", "1");
     auto next_frame = std::async(std::launch::async, [&] {
@@ -704,7 +718,16 @@ void native_desktop_connections(const fs::path& path) {
     tempshare::HttpServer host_a(a), host_b(b);
     require(host_a.start(0, true) && host_b.start(0, true), "start both native desktop listeners");
     a.start(); b.start();
-    require(host_a.peer().join(host_b.url("127.0.0.1")), "join remote directly from native desktop");
+    host_b.peer().set_identity(std::string(32, 'b'), "Test peer B");
+    require(!host_a.peer().join(host_b.url("127.0.0.1"), {"https://127.0.0.1:" + std::to_string(host_b.port())}),
+            "alternate addresses cannot change transport security");
+    const auto started = host_a.peer().join("http://localhost:" + std::to_string(host_b.port()), {host_b.url("127.0.0.1")}, std::string(32, 'b'));
+    if (!started) std::cerr << "native join diagnostic: port=" << host_b.port() << " active=" << a.is_active()
+        << " paired=" << a.snapshot().pairing.has_value() << " attached=" << host_a.peer().snapshot().attached
+        << " hostname=" << tempshare::parse_lan_endpoint("http://localhost:" + std::to_string(host_b.port()), true).has_value()
+        << " loopback=" << host_b.url("127.0.0.1") << '\n';
+    require(started,
+            "join remote through an available alternate without asking users to select an address");
     eventually([&] { return b.snapshot().pairing.has_value(); }, "remote desktop receives approval request");
     require(!host_a.peer().snapshot().approved && b.snapshot().pairing->state == tempshare::State::pending,
             "desktop discovery never auto-approves remote access");
@@ -795,6 +818,15 @@ void gateway_connections(const fs::path& path) {
 
 
 void peer_protocol_contracts() {
+    const tempshare::LocalNetwork local{"192.168.1.10", 0xc0a8010a, 0xffffff00};
+    tempshare::Peer peer{"192.168.1.10", 9999, "Same PC other instance", "Windows", false, std::string(32, 'b'), {}};
+    require(tempshare::is_local_peer(peer, {local}, std::string(32, 'a')), "hide local address even with a different port and install identity");
+    peer.id.clear();
+    require(tempshare::is_local_peer(peer, {local}, ""), "hide old protocol self announcements without a device ID");
+    peer.address = "192.168.1.20"; peer.id = std::string(32, 'a');
+    require(tempshare::is_local_peer(peer, {local}, peer.id), "hide same install identity after address changes");
+    peer.id = std::string(32, 'b');
+    require(!tempshare::is_local_peer(peer, {local}, std::string(32, 'a')), "keep another physical device with the same hostname visible");
     const auto endpoint = tempshare::parse_lan_endpoint(" http://192.168.1.2:8787/s/2/#0123456789abcdef0123456789abcdef ");
     require(endpoint && endpoint->route == "/s/2" && endpoint->invitation.size() == 32, "parse full LAN invitation links");
     require(tempshare::parse_lan_endpoint("http://office-pc.local:8787").has_value(), "allow LAN hostnames for background private-address resolution");
@@ -840,6 +872,26 @@ void revised_session_lifecycle(const fs::path& path) {
     require(!session.cast_host(host), "revoking screen permission invalidates capture keys");
 }
 
+void configurable_session_lifetime(const fs::path& path) {
+    tempshare::Session session(path / "long-running", {}, 40ms);
+    require(session.set_lifetime(0ms) && !session.is_active(), "duration changes cannot revive a stopped session");
+    session.start();
+    auto state = session.snapshot();
+    const auto pair = session.pair(state.code, "Home device");
+    require(pair && session.decide_pairing(pair->token, true), "unlimited sessions still require explicit pairing");
+    std::this_thread::sleep_for(60ms);
+    require(session.authorized(pair->token) && !session.expire() && session.snapshot().unlimited,
+            "unlimited session stays authorized beyond the original deadline");
+    require(!session.set_lifetime(-1ms) && !session.set_lifetime(std::chrono::hours(24 * 31)), "reject invalid session durations");
+    require(session.set_lifetime(40ms) && !session.snapshot().unlimited, "finite duration applies without unpairing");
+    require(session.send_text("retained"), "changing duration preserves messages and authorization");
+    std::this_thread::sleep_for(60ms);
+    require(!session.authorized(pair->token) && session.expire(), "finite sessions retain expiry behavior");
+    require(session.set_lifetime(0ms) && !session.is_active(), "unlimited preference does not revive expired authorization");
+    session.start(); session.end();
+    require(!session.is_active() && !session.authorized(pair->token), "explicit end stops an unlimited session");
+}
+
 }  // namespace
 
 int main() {
@@ -847,6 +899,7 @@ int main() {
         Sandbox scratch;
         peer_protocol_contracts();
         revised_session_lifecycle(scratch.path);
+        configurable_session_lifetime(scratch.path);
         native_desktop_connections(scratch.path);
         gateway_connections(scratch.path);
         roundtrip(scratch.path);

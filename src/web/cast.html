@@ -29,22 +29,27 @@
         <option value="custom">自定义</option>
         <option value="smooth">流畅</option>
         <option value="clear">清晰</option>
-        <option value="original">原始分辨率</option>
+        <option value="original" selected>原始分辨率 · 清晰优先</option>
       </select></label>
       <label>画质 <select id="quality">
-        <option value="0">原始分辨率</option>
+        <option value="0" selected>原始分辨率</option>
         <option value="2160">2160p · 4K</option>
         <option value="1440">1440p · QHD</option>
-        <option value="1080" selected>1080p</option>
+        <option value="1080">1080p</option>
         <option value="720">720p</option>
         <option value="480">480p</option>
       </select></label>
       <label>帧率 <select id="rate">
         <option value="120">120 fps</option>
-        <option value="60">60 fps</option>
-        <option value="30" selected>30 fps</option>
+        <option value="60" selected>60 fps</option>
+        <option value="30">30 fps</option>
         <option value="15">15 fps</option>
         <option value="8">8 fps</option>
+      </select></label>
+      <label>直连码率 <select id="bitrate">
+        <option value="0">自动 · 按画面规格</option>
+        <option value="8">8 Mbps</option><option value="16">16 Mbps</option>
+        <option value="32">32 Mbps</option><option value="64">64 Mbps</option><option value="120">120 Mbps</option>
       </select></label>
       <label><input id="audio" type="checkbox"> 请求共享音频</label>
     </div>
@@ -55,6 +60,7 @@
     <p id="status" class="message" role="status"></p>
     <p id="capture-info" class="message"></p>
     <p id="transport-info" class="message" aria-live="polite"></p>
+    <p class="file-meta">帧率为目标上限，实际取决于共享来源、编码负载及网络。静态画面可能减少重复帧；兼容播放最高1080p/60fps且无音频，更高规格请用直连。</p>
     <p id="audio-info" class="message"></p>
   </main>
 </body>

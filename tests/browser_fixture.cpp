@@ -29,6 +29,8 @@ int main() {
                 if (pending) host.decide_pairing(pending->token, true);
             }
             if (command == "message") host.send_text("native desktop message");
+            if (command == "unlimited") host.set_lifetime(tempshare::Session::Clock::duration::zero());
+            if (command == "finite") host.set_lifetime(std::chrono::hours(2));
             if (command == "permissions") {
                 auto permissions = host.permissions(); permissions.text = !permissions.text; host.set_permissions(permissions);
             }

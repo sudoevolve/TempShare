@@ -21,6 +21,7 @@ inline constexpr std::uint64_t max_file_size = 1024ULL * 1024 * 1024;
 inline constexpr std::uint64_t max_session_bytes = 4ULL * 1024 * 1024 * 1024;
 inline constexpr std::uint64_t minimum_free_bytes = 16ULL * 1024 * 1024;
 inline constexpr std::size_t max_text_size = 32 * 1024;
+inline constexpr std::size_t max_cast_frame_size = 2 * 1024 * 1024;
 
 enum class State { pending, approved, rejected, uploading, complete };
 enum class UploadFailure { unavailable, storage, insufficient_space };
@@ -123,6 +124,8 @@ struct Snapshot {
     std::vector<DownloadActivity> downloads;
     std::uint64_t remaining_seconds = 0;
     std::size_t pending_transfers = 0;
+    bool unlimited = false;
+    std::uint64_t lifetime_seconds = 0;
 };
 
 struct NotificationState {
@@ -156,6 +159,8 @@ public:
     void start();
     void end();
     bool extend();
+    /** @brief 设置会话时长并从现在起应用；零表示不限时，不会重新激活已结束会话。 */
+    bool set_lifetime(Clock::duration lifetime);
     bool is_active() const;
     bool expire();
     bool invitation_active(std::string_view invitation) const;

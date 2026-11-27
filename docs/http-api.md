@@ -10,7 +10,7 @@
 | `POST /api/pair` | `X-Invitation` 为六位短码或二维码中的邀请令牌。可使用编码后的 `X-Device-Name`。成功返回 201、验证码和会话 Cookie，桌面批准后获得访问权限。 |
 | `GET /api/pair` | 返回 `state`、权限、列表版本和 `castReady`。401 表示会话不可用。 |
 | `DELETE /api/pair` | 撤销当前请求或离开当前设备，成功返回 204。共享清单和消息保留，未完成上传和投屏停止；这不等同于桌面「结束会话」。 |
-| `POST /api/pair/extend` | 已配对设备显式延长本会话30分钟，成功返回204。 |
+| `POST /api/pair/extend` | 已配对设备按桌面配置的有限时长重新计时，成功返回204；不限时会话无需续期。 |
 | `POST /api/pair/trusted` | HTTPS 下使用此前保存的 `ts_<端口>_trusted` Cookie 快速配对，兼容已有的旧版 Cookie。 |
 
 `filesRevision`、`offersRevision` 和 `textRevision` 是资源变化提示。版本变化后重新读取对应列表。版本值由当前服务进程维护。
@@ -56,7 +56,9 @@
 - 本机投递控制台通过 `X-Cast-Key` 使用 `/api/cast/host`、`/api/cast/ready`、`/api/cast/offer` 和 `/api/cast/stop`。
 - 已配对的观看端向 `POST /api/cast/viewer` 发送 `X-Cast-Watch: 1`，并为当前观看操作生成一个 32 位十六进制值，放在 `X-Cast-Viewer` 中。定期刷新；退出时携带同一标识和 `X-Cast-Watch: 0`。活跃租约被其他标签页占用时返回 409。旧客户端可沿用无 `X-Cast-Viewer` 的单观看者流程。
 - `POST /api/cast/answer` 带同一观看标识及 `X-Cast-Revision`，正文为 SDP。信令由桌面端提供，媒体经浏览器间的 WebRTC 流传输。
-- 观看端可在刷新租约时带上 `X-Cast-Frames: 1` 请求兼容播放，并通过返回的 `frames` 字段确认。控制台使用本机授权和当前 `X-Cast-Revision` 向 `POST /api/cast/frame` 提交不超过 384 KiB 的 JPEG。已配对的观看端携带原租约标识从 `GET /api/cast/frame` 获取单帧，可用 `X-Cast-After` 传入上次响应的 `X-Cast-Sequence`。无更新时返回 204。
+- 观看端可在刷新租约时带上 `X-Cast-Frames: 1` 请求兼容播放，并通过返回的 `frames` 字段确认。控制台使用本机授权和当前 `X-Cast-Revision` 向 `POST /api/cast/frame` 提交不超过2MiB的JPEG（0.5.0起）；旧版主机仍限制384KiB。已配对的观看端携带原租约标识从 `GET /api/cast/frame` 获取单帧，可用 `X-Cast-After` 传入上次响应的 `X-Cast-Sequence`。无更新时返回204。服务只保留最新帧，最小发布间隔8ms，不堆积过时画面。
 - 兼容播放可以加 `X-Cast-Wait: 1` 等待下一帧，最多 800 毫秒。每个连接同时允许一个等待请求。
+
+`GET /api/pair` 的 `unlimited` 从0.5.0起表示桌面会话是否不限时。此时 `remainingSeconds=0` 表示没有倒计时，不能解释成即将过期；旧服务器不含此字段时沿用有限时语义。时长仅由本机桌面设置，远端无修改时长策略或无限授权的接口。待批准请求仍有独立的2分钟确认期限，结束/离开/撤销仍立即生效。核心 `Session` 构造默认值保持30分钟以兼容已有调用方，桌面应用显式读取本机偏好，缺省为零（不限时）。
 
 [局域网 HTTPS 与设备验收](lan-https.md)

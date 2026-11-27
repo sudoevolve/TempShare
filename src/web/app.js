@@ -1183,16 +1183,16 @@ async function poll() {
       throw new Error('pair');
     }
     const { state, verification, upload, download, text, textRevision, castReady, filesRevision, offersRevision,
-      computer, remainingSeconds, castAllowed } = await pair.json();
+      computer, remainingSeconds, castAllowed, unlimited } = await pair.json();
     if (attempt !== pairingAttempt) return;
     computerName = computer || '';
     sessionSeconds = remainingSeconds || 0;
     showConnection(state, verification);
     if (state !== 'approved') return;
-    byId('session-deadline').textContent = sessionSeconds ? `会话剩余 ${Math.ceil(sessionSeconds / 60)} 分钟` : '任务完成后到期';
+    byId('session-deadline').textContent = unlimited ? '不限时 · 可随时离开' : sessionSeconds ? `会话剩余 ${Math.ceil(sessionSeconds / 60)} 分钟` : '任务完成后到期';
     byId('session-deadline').hidden = false;
-    byId('extend-session').hidden = false;
-    if (sessionSeconds > 0 && sessionSeconds <= 120) message('会话即将到期，可点击延长；进行中的任务会获得完成宽限。');
+    byId('extend-session').hidden = unlimited === true;
+    if (!unlimited && sessionSeconds > 0 && sessionSeconds <= 120) message('会话即将到期，可点击延长；进行中的任务会获得完成宽限。');
     showCastAvailability(castReady === true && castAllowed !== false);
     dropzone.hidden = !upload;
     byId('select-resumable').hidden = !upload || byId('resume-option').hidden || typeof window.showOpenFilePicker !== 'function';
@@ -1444,7 +1444,7 @@ start();
 byId('extend-session').addEventListener('click', async () => {
   try {
     if (!(await request('/api/pair/extend', 'POST')).ok) throw new Error('extend');
-    message('已延长会话30分钟'); poll();
+    message('会话已按电脑设置的时长重新计时'); poll();
   } catch { message('无法延长，请检查连接后重试。', true); }
 });
 byId('enable-notifications').hidden = !('Notification' in window) || !window.isSecureContext;

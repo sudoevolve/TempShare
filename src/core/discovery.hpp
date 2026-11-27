@@ -6,6 +6,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -36,6 +37,8 @@ struct LocalNetwork {
 std::vector<LocalNetwork> lan_networks();
 std::string device_hostname();
 bool is_private_ipv4(const std::string& address);
+/** @brief 按安装标识或任一本机网卡地址识别自身，不以端口或设备昵称区分本机多实例。 */
+bool is_local_peer(const Peer& peer, const std::vector<LocalNetwork>& networks, std::string_view id);
 std::vector<std::string> resolve_lan_addresses(const std::string& hostname);
 bool permits_private_lan_peer(const std::vector<LocalNetwork>& interfaces,
                               const std::string& local, const std::string& remote);

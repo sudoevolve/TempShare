@@ -76,6 +76,16 @@ struct Options {
     std::string key;
 };
 
+constexpr std::array<int, 5> session_durations{0, 30, 120, 480, 1440};
+const std::vector<std::string> session_duration_names{"不限时 · 手动结束", "30 分钟", "2 小时", "8 小时", "24 小时"};
+
+int load_session_minutes(const std::filesystem::path& config) {
+    std::ifstream input(config / "session-duration");
+    int minutes = 0;
+    if (!(input >> minutes) || std::find(session_durations.begin(), session_durations.end(), minutes) == session_durations.end()) return 0;
+    return minutes;
+}
+
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int i = 1; i < argc; i += 2) {
@@ -162,16 +172,12 @@ struct View {
     using Page = tempshare::SnapshotPage;
     Page page = Page::home;
     std::string selected_address;
-    std::size_t peer_page = 0;
-    std::size_t offer_page = 0;
     std::string status;
     std::string path;
     std::string folder;
     std::string draft;
     std::string previous_invitation;
-    std::size_t message_page = 0;
     std::uint64_t last_read_messages = 0;
-    std::size_t device_page = 0;
     std::future<std::string> folder_job;
     std::thread folder_worker;
     std::shared_ptr<std::atomic<bool>> folder_cancel;
@@ -208,18 +214,6 @@ std::vector<std::filesystem::path> pick_paths(View& view, bool directory) {
     auto paths = choose_paths(directory, &failed);
     if (failed) view.status = "无法打开文件选择器，可在文件页输入共享路径，或在设置中输入接收目录";
     return paths;
-}
-
-std::size_t page_controls(Ui& ui, std::size_t& page, std::size_t total, std::size_t per_page,
-                          float x, float y, float width) {
-    const std::size_t pages = total ? (total - 1) / per_page + 1 : 1;
-    page = std::min(page, pages - 1);
-    if (pages == 1) return 0;
-    label(ui, std::to_string(page + 1) + " / " + std::to_string(pages), {x + width - 116, y, 46, 28},
-          12, muted);
-    if (page > 0 && button(ui, "‹", {x + width - 68, y, 30, 28})) --page;
-    if (page + 1 < pages && button(ui, "›", {x + width - 32, y, 30, 28})) ++page;
-    return page * per_page;
 }
 
 void share_paths(tempshare::Session& session, View& view, const std::vector<std::filesystem::path>& paths, bool image = false) {
@@ -347,7 +341,6 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                 if (waiting && button(ui, std::to_string(waiting) + " 个文件待接收",
                                       {qr_left + 18, top + 143, 220, 36}, true)) {
                     view.page = View::Page::share;
-                    view.offer_page = 0;
                     window.wake();
                 }
                 if (snapshot.capture_ready) {
@@ -397,9 +390,10 @@ void render_connection(Ui& ui, aino::Window& window, tempshare::Session& session
                 view.status = "会话已结束";
             }
         } else {
-            if (button(ui, "延长 · " + std::to_string((snapshot.remaining_seconds + 59) / 60) + " 分",
+            if (button(ui, snapshot.unlimited ? "不限时 · 设置" : "续期 · " + std::to_string((snapshot.remaining_seconds + 59) / 60) + " 分",
                        {qr_left + 18, top + 301, 101, 28})) {
-                if (session.extend()) view.status = "已从现在起延长会话 30 分钟";
+                if (snapshot.unlimited) view.page = View::Page::settings;
+                else if (session.extend()) view.status = "已从现在起重新计时 " + std::to_string(snapshot.lifetime_seconds / 60) + " 分钟";
             }
             if (button(ui, "结束会话", {qr_left + 132, top + 301, 106, 28})) {
                 if (active_requests || snapshot.capture_ready || snapshot.pairing || !snapshot.messages.empty()) {
@@ -457,24 +451,20 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
     std::stable_partition(pending.begin(), pending.end(), [](const tempshare::Offer* offer) {
         return offer->state == State::pending;
     });
-    const auto offer_start = page_controls(ui, view.offer_page, pending.size(), 3, x, list_y, transfer_width);
     std::vector<std::string> visible;
     std::uint64_t visible_bytes = 0;
-    const auto* first = offer_start < pending.size() ? pending[offer_start] : nullptr;
-    for (std::size_t i = 0; first && i < pending.size(); ++i) {
-        const auto& candidate = *pending[i];
-        const bool same_batch = first->batch.empty() ? i >= offer_start && i < offer_start + 3 :
-            candidate.batch == first->batch;
-        if (candidate.state == State::pending && same_batch) {
+    for (const auto* entry : pending) {
+        const auto& candidate = *entry;
+        if (candidate.state == State::pending) {
             visible.push_back(candidate.id);
             visible_bytes += candidate.size;
         }
     }
-    if (visible.size() > 1 && button(ui, "接收 " + std::to_string(visible.size()) + " 个",
+    if (visible.size() > 1 && button(ui, "接收全部 " + std::to_string(visible.size()),
                                      {x + 104, list_y, 92, 28}, true)) {
         view.batch_ids = visible; view.batch_accept = true; view.batch_open = true;
     }
-    if (visible.size() > 1 && transfer_width >= 405 && button(ui, "拒绝这批", {x + 200, list_y, 73, 28})) {
+    if (visible.size() > 1 && transfer_width >= 405 && button(ui, "拒绝全部", {x + 200, list_y, 73, 28})) {
         view.batch_ids = visible; view.batch_accept = false; view.batch_open = true;
     }
     if (visible.size() > 1 && transfer_width >= 400) {
@@ -485,8 +475,12 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
         label(ui, "暂无接收请求", {x, row, transfer_width, 26}, 13, muted);
         row += 36;
     } else {
-        for (std::size_t i = offer_start; i < std::min(offer_start + 3, pending.size()); ++i, row += 48) {
-            const auto& offer = *pending[i];
+        const float request_height = std::min(static_cast<float>(pending.size()) * 48,
+            std::max(96.0f, (bottom - row - 100) * .45f));
+        ui.scroll({x, row, transfer_width, request_height}, static_cast<int>(pending.size()), 48,
+          [&](int index, const Rect& box) {
+            const float row = box.y;
+            const auto& offer = *pending[static_cast<std::size_t>(index)];
             const auto id = static_cast<std::uint64_t>(std::hash<std::string>{}(offer.id));
             card(ui, {x, row, transfer_width, 42});
             const auto note = offer.transferred ? readable_size(offer.transferred) + " / " + readable_size(offer.size) :
@@ -505,7 +499,8 @@ void render_share(Ui& ui, aino::Window& window, tempshare::Session& session,
             } else if (offer.state == State::uploading) {
                 if (button(ui, "取消", {x + transfer_width - 64, row + 7, 52, 28}, false, id + 2)) session.cancel_offer(offer.id);
             }
-        }
+        });
+        row += request_height + 8;
     }
     label(ui, "已共享", {x, row, transfer_width, 28}, 16, text, true);
     row += 34;
@@ -571,37 +566,30 @@ void render_remote_files(Ui& ui, tempshare::HttpServer& http, tempshare::Session
 
 
 void render_nearby(Ui& ui, View& view, tempshare::Discovery& discovery, bool nearby_available, float x, float width,
-                   const std::function<void(const std::string&)>& join) {
+                   float bottom, const std::function<void(const std::string&)>& join,
+                   const std::function<bool(const tempshare::Peer&)>& connected) {
     const auto peers = discovery.peers();
     ui.input(&view.nearby_address, {x, 106, width - 94, 31}, Style().hint("粘贴局域网地址、主机名或完整邀请链接"));
     if (button(ui, "连接设备", {x + width - 85, 106, 85, 31})) join(view.nearby_address);
-    const auto first = page_controls(ui, view.peer_page, peers.size(), 6, x, 146, width);
     if (button(ui, "刷新", {x, 151, 62, 26})) {
         discovery.refresh();
         view.status = nearby_available ? "已重新发送局域网发现请求" : "没有可用的局域网地址";
     }
     if (peers.empty()) label(ui, discovery.status(),
                             {x + 73, 149, width - 75, 32}, 13, muted);
-    float y = 183;
-    for (auto i = first; i < std::min(first + 6, peers.size()); ++i, y += 56) {
-        const auto& peer = peers[i];
-        card(ui, {x, y, width, 50});
+    ui.scroll({x, 183, width, std::max(56.0f, bottom - 183)}, static_cast<int>(peers.size()), 56,
+      [&](int index, const Rect& row) {
+        const float y = row.y;
+        const auto& peer = peers[static_cast<std::size_t>(index)];
+        card(ui, {x, y, width - 10, 50});
         label(ui, peer.name, {x + 14, y + 3, width - 120, 24}, 15, text, true);
         label(ui, peer.platform + " · " + peer.address + (peer.id.empty() ? "" : " · " + peer.id.substr(0, 6)),
               {x + 14, y + 26, width - 120, 17}, 12, muted);
         ui.tooltip({x + 14, y + 3, width - 120, 42}, peer.name + "\n" + peer.url() +
                    (peer.id.empty() ? "" : "\n设备标识 " + peer.id));
         const Rect action{x + width - 85, y + 9, 70, 32};
-        if (peer.addresses.size() > 1) {
-            int selected_address = 0;
-            if (ui.menu("连接", peer.addresses, &selected_address, action,
-                        Style().secondary().font(12).id(std::hash<std::string>{}(peer.url())))) {
-                auto target = peer;
-                target.address = peer.addresses[static_cast<std::size_t>(selected_address)];
-                join(target.url());
-            }
-        } else if (button(ui, "连接", action, false, std::hash<std::string>{}(peer.url()))) join(peer.url());
-    }
+        if (button(ui, connected(peer) ? "查看" : "连接", action, false, std::hash<std::string>{}(peer.url()))) join(peer.url());
+    });
 }
 
 void render_received(Ui& ui, aino::Window& window, tempshare::Session& session, View& view,
@@ -682,6 +670,7 @@ void render_settings(Ui& ui, View& view, tempshare::Session& session, const temp
     card(ui, {x, 106, width, 150});
     label(ui, "文件接收目录", {x + 18, 119, width - 36, 30}, 16, text, true);
     label(ui, snapshot.directory.u8string(), {x + 18, 151, width - 36, 28}, 13, muted);
+    ui.tooltip({x + 18, 151, width - 36, 28}, snapshot.directory.u8string());
     if (view.space_directory != snapshot.directory) {
         view.space_directory = snapshot.directory;
         std::error_code error;
@@ -710,8 +699,8 @@ void render_settings(Ui& ui, View& view, tempshare::Session& session, const temp
         else view.status = "无法创建默认接收目录";
     }
 
-    label(ui, "此页为本机全局设置，保存接收目录会同步到全部会话。", {x, 280, width, 30}, 13, muted);
-    label(ui, "设备授权请打开侧栏的「设备与权限」。", {x, 319, width, 28}, 13, muted);
+    label(ui, "接收目录为本机全局设置。", {x, 280, width, 24}, 13, muted);
+    label(ui, "设备授权请打开侧栏的「设备与权限」。", {x, 304, width, 20}, 12, muted);
 }
 
 bool paired(const tempshare::Snapshot& snapshot) {
@@ -719,7 +708,7 @@ bool paired(const tempshare::Snapshot& snapshot) {
 }
 
 void render_devices(Ui& ui, tempshare::Session& session, const tempshare::Snapshot& snapshot,
-                    View& view, float x, float width) {
+                    View& view, float x, float width, float bottom) {
     card(ui, {x, 106, width, 185});
     label(ui, "当前设备权限（不影响其他设备）", {x + 18, 119, width - 36, 28}, 16, text, true);
     auto permissions = snapshot.permissions;
@@ -751,11 +740,11 @@ void render_devices(Ui& ui, tempshare::Session& session, const tempshare::Snapsh
               {x + 18, 323, width - 36, 30}, 14, muted);
     }
     label(ui, "已记住的设备", {x, 423, width, 30}, 16, text, true);
-    const auto first = page_controls(ui, view.device_page, snapshot.trusted.size(), 2, x, 453, width);
-    float y = 491;
-    for (auto i = first; i < std::min(first + 2, snapshot.trusted.size()); ++i, y += 54) {
-        const auto& device = snapshot.trusted[i];
-        card(ui, {x, y, width, 48});
+    ui.scroll({x, 461, width, std::max(54.0f, bottom - 461)}, static_cast<int>(snapshot.trusted.size()), 54,
+      [&](int index, const Rect& row) {
+        const auto& device = snapshot.trusted[static_cast<std::size_t>(index)];
+        const float y = row.y;
+        card(ui, {x, y, width - 10, 48});
         label(ui, device.name, {x + 14, y + 3, width - 126, 23}, 14, text, true);
         std::string policy;
         if (device.permissions.download) policy += "下载  ";
@@ -766,11 +755,11 @@ void render_devices(Ui& ui, tempshare::Session& session, const tempshare::Snapsh
         if (button(ui, "撤销信任", {x + width - 100, y + 8, 85, 32}, false, std::hash<std::string>{}(device.key))) {
             view.status = session.revoke_device(device.key) ? "设备信任已撤销" : "无法删除设备信任";
         }
-    }
+    });
 }
 
 void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
-                 const tempshare::Snapshot& snapshot, View& view, float x, float width, const tempshare::HttpServer& http) {
+                 const tempshare::Snapshot& snapshot, View& view, float x, float width, float bottom, const tempshare::HttpServer& http) {
     card(ui, {x, 106, width, 193});
     label(ui, "发送文本、链接或代码", {x + 18, 118, width - 36, 30}, 16, text, true);
     if (!paired(snapshot) || !snapshot.permissions.text) {
@@ -782,7 +771,6 @@ void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
     const auto send = [&session, &view](const std::string& value) {
         if (session.send_text(value)) {
             view.status = "文本已发送";
-            view.message_page = 0;
             return true;
         }
         view.status = "请输入有效文本，上限为 32 KiB";
@@ -813,15 +801,16 @@ void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
     std::vector<const tempshare::Message*> messages;
     for (auto it = snapshot.messages.rbegin(); it != snapshot.messages.rend(); ++it)
         if (view.message_search.empty() || it->text.find(view.message_search) != std::string::npos) messages.push_back(&*it);
-    const auto first = page_controls(ui, view.message_page, messages.size(), 2, x, 389, width);
-    float y = 423;
-    for (auto i = first; i < std::min(first + 2, messages.size()); ++i, y += 80) {
-        const auto& entry = *messages[i];
-        card(ui, {x, y, width, 72});
+    if (messages.empty()) label(ui, view.message_search.empty() ? "暂无消息，发送内容后会显示在这里" : "没有匹配的消息", {x, 396, width, 28}, 13, muted);
+    ui.scroll({x, 393, width, std::max(80.0f, bottom - 393)}, static_cast<int>(messages.size()), 92,
+      [&](int index, const Rect& row) {
+        const auto& entry = *messages[static_cast<std::size_t>(index)];
+        const float y = row.y;
+        card(ui, {x, y, width - 10, 84});
         label(ui, std::string(entry.from_desktop ? "本机" : "对方") + " · " + readable_time(entry.sent_at),
               {x + 13, y + 4, width - 32, 22}, 12, muted);
         ui.draw_text(entry.attachment.empty() ? entry.text : "图片 · " + entry.text,
-                     {x + 13, y + 28, width - 98, 37}, text, Style().font(13).top().wrap_text());
+                     {x + 13, y + 28, width - 108, 46}, text, Style().font(13).top().wrap_text());
         if (button(ui, entry.attachment.empty() ? "查看" : "打开", {x + width - 72, y + 22, 57, 28}, false, entry.sequence)) {
             if (entry.attachment.empty()) { view.message_detail = entry; view.detail_text = entry.text; }
             else if (entry.remote_attachment) {
@@ -836,7 +825,7 @@ void render_sync(Ui& ui, aino::Window& window, tempshare::Session& session,
                 if (path.empty() || !open_folder(path)) view.status = "附件不可用，请查看文件页或接收记录";
             }
         }
-    }
+    });
 }
 
 void render_cast(Ui& ui, tempshare::Session& session, const tempshare::HttpServer& server,
@@ -883,7 +872,7 @@ void render_cast(Ui& ui, tempshare::Session& session, const tempshare::HttpServe
 
 void render_home(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers,
                  float x, float width, float nearby_width, const std::function<void(const std::string&)>& join,
-                 const std::string& discovery_status) {
+                 const std::string& discovery_status, const std::function<bool(const tempshare::Peer&)>& connected) {
     struct Feature {
         const char* title;
         const char* detail;
@@ -936,7 +925,7 @@ void render_home(Ui& ui, View& view, const std::vector<tempshare::Peer>& peers,
         ui.system_icon(SystemIcon::Network, {x + 15, y + 13, 28, 28}, accent);
         label(ui, peer.name, {x + 55, y + 4, nearby_width - 146, 24}, 14, text, true);
         label(ui, peer.platform + " · " + peer.address, {x + 55, y + 28, nearby_width - 146, 19}, 12, muted);
-        if (button(ui, "连接", {x + nearby_width - 75, y + 12, 61, 30}, false,
+        if (button(ui, connected(peer) ? "查看" : "连接", {x + nearby_width - 75, y + 12, 61, 30}, false,
                    std::hash<std::string>{}(peer.url()))) join(peer.url());
     }
 }
@@ -951,7 +940,7 @@ struct Connection {
 
     Connection(const Options& options, const std::filesystem::path& inbox, const std::filesystem::path& config,
                const std::function<void()>& repaint, std::size_t index)
-        : session(inbox, repaint, std::chrono::minutes(30),
+        : session(inbox, repaint, std::chrono::minutes(load_session_minutes(config)),
                    options.cert.empty() || config.empty() ? std::filesystem::path{} : config / "trusted",
                   config.empty() ? std::filesystem::path{} :
                       config / (index ? "received-history-" + std::to_string(index + 1) : "received-history")),
@@ -1026,7 +1015,37 @@ int run(const Options& options) {
                                    [primary] { return primary->http.networks(); }, repaint, device_identity, nickname);
     int selected_connection = 0;
     bool requests_open = false;
+    const auto connected_slot = [&](const tempshare::Peer& peer) {
+        for (std::size_t slot = 0; slot < connections.size(); ++slot) {
+            const auto link = connections[slot]->http.peer().snapshot();
+            if (!link.attached) continue;
+            if (!peer.id.empty() && link.device_id == peer.id) return static_cast<int>(slot);
+            auto target = tempshare::parse_lan_endpoint(link.address);
+            if (target && target->port == peer.port && target->secure == peer.secure &&
+                (target->host == peer.address || std::find(peer.addresses.begin(), peer.addresses.end(), target->host) != peer.addresses.end()))
+                return static_cast<int>(slot);
+        }
+        return -1;
+    };
+    const auto is_connected = [&](const tempshare::Peer& peer) { return connected_slot(peer) >= 0; };
     const auto join_peer = [&](const std::string& address) {
+        std::vector<std::string> alternatives;
+        std::string expected_device;
+        for (auto peer : discovery.peers()) if (peer.url() == address) {
+            const auto existing = connected_slot(peer);
+            if (existing >= 0) {
+                selected_connection = existing;
+                auto& selected = connections[static_cast<std::size_t>(existing)]->view;
+                selected.page = View::Page::home; selected.connection_open = true;
+                selected.status = "此设备已连接"; window.wake(); return;
+            }
+            expected_device = peer.id;
+            for (const auto& candidate : peer.addresses) {
+                peer.address = candidate;
+                if (alternatives.size() < 16) alternatives.push_back(peer.url());
+            }
+            break;
+        }
         auto slot = static_cast<std::size_t>(selected_connection);
         if (connections[slot]->session.snapshot(View::Page::home).pairing || connections[slot]->http.peer().snapshot().attached) {
             slot = 0;
@@ -1035,7 +1054,7 @@ int run(const Options& options) {
         }
         if (slot == connections.size()) {
             connections[static_cast<std::size_t>(selected_connection)]->view.status = "当前设备已满，请先离开一个连接";
-        } else if (connections[slot]->http.peer().join(address)) {
+        } else if (connections[slot]->http.peer().join(address, alternatives, expected_device)) {
             selected_connection = static_cast<int>(slot);
             connections[slot]->view.page = View::Page::home;
             connections[slot]->view.connection_open = true;
@@ -1175,7 +1194,6 @@ int run(const Options& options) {
             if (view.previous_invitation != snapshot.invitation) {
                 view.previous_invitation = snapshot.invitation;
                 view.draft.clear();
-                view.message_page = 0;
                 view.confirm_end = false;
             }
             const std::array<const char*, 8> titles{
@@ -1308,10 +1326,12 @@ int run(const Options& options) {
                   {x, 24, content_width, 50}, 29, text, true);
             if (view.page == View::Page::home) {
                 label(ui, "选择一种方式开始分享", {x, 69, content_width, 22}, 13, muted);
+            } else if (view.page == View::Page::settings) {
+                label(ui, "本机设置 · 应用到全部会话", {x, 77, content_width, 20}, 12, muted);
             } else {
                 const auto remote = http.peer().snapshot();
                 const auto target = remote.attached ? remote.device : snapshot.pairing ? snapshot.pairing->name : std::string{};
-                label(ui, target.empty() ? "邀请设备或在附近设备中发起连接" : "当前设备 · " + target,
+                label(ui, target.empty() ? "邀请设备或在附近设备中发起连接" : "连接对象 · " + target,
                       {x, 77, content_width, 20}, 12, muted);
                 if (!target.empty()) ui.tooltip({x, 77, content_width, 20}, "当前设备 · " + target +
                     (remote.attached ? "\n" + remote.address + " · " + remote.device_id.substr(0, 8) : ""));
@@ -1320,7 +1340,7 @@ int run(const Options& options) {
             switch (view.page) {
             case View::Page::all: break;
             case View::Page::home:
-                render_home(ui, view, discovery.peers(), x, width - x - 28, content_width, join_peer, discovery.status());
+                render_home(ui, view, discovery.peers(), x, width - x - 28, content_width, join_peer, discovery.status(), is_connected);
                 if (page != view.page) window.wake();
                 break;
             case View::Page::share:
@@ -1335,13 +1355,26 @@ int run(const Options& options) {
                     }
                 } else render_share(ui, window, session, snapshot, view, x, content_width, height - 53);
                 break;
-            case View::Page::sync: render_sync(ui, window, session, snapshot, view, x, content_width, http); break;
+            case View::Page::sync: render_sync(ui, window, session, snapshot, view, x, content_width, height - 53, http); break;
             case View::Page::cast: render_cast(ui, session, http, snapshot, view, x, content_width); break;
-            case View::Page::nearby: render_nearby(ui, view, discovery, !http.networks().empty(), x, content_width, join_peer); break;
+            case View::Page::nearby: render_nearby(ui, view, discovery, !http.networks().empty(), x, content_width, height - 53, join_peer, is_connected); break;
             case View::Page::received: render_received(ui, window, session, view, snapshot, x, content_width, height - 53); break;
-            case View::Page::devices: render_devices(ui, session, snapshot, view, x, content_width); break;
+            case View::Page::devices: render_devices(ui, session, snapshot, view, x, content_width, height - 53); break;
             case View::Page::settings:
                 render_settings(ui, view, session, snapshot, config_path, x, content_width);
+                card(ui, {x, 327, content_width, 133});
+                label(ui, "会话时长", {x + 18, 338, content_width - 36, 28}, 16, text, true);
+                int duration_choice = 0;
+                for (std::size_t i = 0; i < session_durations.size(); ++i)
+                    if (snapshot.lifetime_seconds == static_cast<std::uint64_t>(session_durations[i]) * 60) duration_choice = static_cast<int>(i);
+                if (ui.menu(session_duration_names[static_cast<std::size_t>(duration_choice)], session_duration_names, &duration_choice,
+                            {x + 18, 375, content_width - 36, 30}, Style().font(13))) {
+                    const int minutes = session_durations[static_cast<std::size_t>(duration_choice)];
+                    for (const auto& item : connections) item->session.set_lifetime(std::chrono::minutes(minutes));
+                    std::ofstream output(config_path / "session-duration"); output << minutes; output.close();
+                    view.status = output ? "已保存会话时长，当前全部会话从现在起应用" : "会话时长已应用，本机偏好保存失败";
+                }
+                label(ui, "应用到全部会话；不限时仍需配对，可随时离开或结束。", {x + 18, 418, content_width - 36, 26}, 12, muted);
                 if (view.device_name.empty()) view.device_name = nickname;
                 ui.input(&view.device_name, {x, 488, content_width - 102, 32}, Style().hint("本机设备名称"));
                 if (button(ui, "保存名称", {x + content_width - 92, 488, 92, 32})) {

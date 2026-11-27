@@ -128,9 +128,16 @@ void PeerLink::set_identity(std::string identity, std::string name) {
 PeerLinkState PeerLink::snapshot() const { std::lock_guard lock(mutex_); return state_; }
 std::string PeerLink::browser_key() const { std::lock_guard lock(mutex_); return browser_key_; }
 
-bool PeerLink::join(const std::string& address) {
+bool PeerLink::join(const std::string& address, const std::vector<std::string>& alternatives, const std::string& expected_device) {
     const auto endpoint = parse_lan_endpoint(address, loopback_);
-    if (!endpoint) return false;
+    if (!endpoint || alternatives.size() > 16 || (!expected_device.empty() && !peer_wire::token(expected_device))) return false;
+    std::vector<LanEndpoint> candidates;
+    for (const auto& value : alternatives) {
+        const auto candidate = parse_lan_endpoint(value, loopback_);
+        if (!candidate || candidate->secure != endpoint->secure || candidate->port != endpoint->port ||
+            candidate->route != endpoint->route || candidate->invitation != endpoint->invitation) return false;
+        if (candidate->host != endpoint->host) candidates.push_back(*candidate);
+    }
 #ifndef CPPHTTPLIB_OPENSSL_SUPPORT
     if (endpoint->secure) return false;
 #endif
@@ -141,6 +148,7 @@ bool PeerLink::join(const std::string& address) {
         std::lock_guard lock(mutex_);
         if (state_.attached || connecting_) return false;
         endpoint_ = *endpoint;
+        alternative_endpoints_ = std::move(candidates); expected_device_ = expected_device;
         cancel_ = true;
         const bool transferring = state_.transferring;
         state_ = {};
@@ -171,14 +179,38 @@ void PeerLink::connect() {
     bool secure;
     std::uint64_t generation;
     std::string route, identity, name;
+    std::string expected_device;
+    std::vector<LanEndpoint> candidates;
     { std::lock_guard lock(mutex_); endpoint = endpoint_; port = port_; secure = secure_; route = public_route_;
-      identity = device_id_; name = device_name_.empty() ? device_hostname() : device_name_; generation = generation_; }
-    if (!is_private_ipv4(endpoint.host) && endpoint.host != "127.0.0.1") {
-        const auto addresses = resolve_lan_addresses(endpoint.host);
-        if (addresses.empty()) {
-            std::lock_guard lock(mutex_); connecting_ = false; state_.status = "主机名未解析到可用的私有IPv4，请粘贴对方地址"; return;
+      identity = device_id_; name = device_name_.empty() ? device_hostname() : device_name_; generation = generation_;
+      candidates = alternative_endpoints_; expected_device = expected_device_; }
+    candidates.insert(candidates.begin(), endpoint);
+    const auto local_networks = loopback_ ? std::vector<LocalNetwork>{} : lan_networks();
+    bool reachable = false;
+    for (auto candidate : candidates) {
+        { std::lock_guard lock(mutex_); if (stopping_ || generation != generation_) return; }
+        const auto addresses = is_private_ipv4(candidate.host) || (loopback_ && candidate.host == "127.0.0.1") ?
+            std::vector<std::string>{candidate.host} : resolve_lan_addresses(candidate.host);
+        for (const auto& address : addresses) {
+            if (std::any_of(local_networks.begin(), local_networks.end(), [&](const LocalNetwork& network) { return network.address == address; })) continue;
+            candidate.host = address;
+            auto probe = client(candidate);
+            probe->set_connection_timeout(1); probe->set_read_timeout(1);
+            std::string health_body;
+            const auto health = probe->Get(candidate.route + "/api/health", [&](const char* data, std::size_t size) {
+                if (size > 1024 - health_body.size()) return false;
+                health_body.append(data, size); return true;
+            });
+            if (health && health->status == 200 && health_body == "{\"service\":\"tempshare\"}") {
+                endpoint = candidate; reachable = true; break;
+            }
         }
-        endpoint.host = addresses.front();
+        if (reachable) break;
+    }
+    if (!reachable) {
+        std::lock_guard lock(mutex_);
+        if (generation == generation_) { connecting_ = false; state_.status = "无法连接此设备，请检查网络、防火墙和服务是否运行；不能连接本机"; }
+        return;
     }
     const auto local = session_.snapshot(SnapshotPage::home);
     const auto own = session_.pair(local.invitation, endpoint.host);
@@ -209,7 +241,12 @@ void PeerLink::connect() {
         }
     }
     const auto fields = response && response->status == 201 ? peer_wire::decode(reply) : std::nullopt;
+    if (fields && fields->size() == 4 && peer_wire::token((*fields)[0]) &&
+        !expected_device.empty() && (*fields)[3] != expected_device) {
+        remote->Delete(endpoint.route + "/api/pair", credentials((*fields)[0]));
+    }
     if (!fields || fields->size() != 4 || !peer_wire::token((*fields)[0]) || !peer_wire::token((*fields)[3]) ||
+        (!expected_device.empty() && (*fields)[3] != expected_device) ||
         !valid_filename((*fields)[2]) || (*fields)[2].size() > 80 || (*fields)[1].size() != 6 ||
         (*fields)[1].find_first_not_of("0123456789") != std::string::npos) {
         session_.disconnect(own->token);

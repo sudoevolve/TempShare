@@ -335,7 +335,7 @@ void Session::start() {
     std::lock_guard lock(mutex_);
     invitation_ = random_token();
     code_ = short_code(code_);
-    expires_ = Clock::now() + lifetime_;
+    expires_ = lifetime_ == Clock::duration::zero() ? Clock::time_point::max() : Clock::now() + lifetime_;
     retry_after_ = {};
     failed_codes_ = 0;
     permissions_ = {};
@@ -376,7 +376,18 @@ bool Session::extend() {
     Notification notification{changed_};
     std::lock_guard lock(mutex_);
     if (!active()) return false;
-    expires_ = Clock::now() + lifetime_;
+    expires_ = lifetime_ == Clock::duration::zero() ? Clock::time_point::max() : Clock::now() + lifetime_;
+    notification.changed = true;
+    return true;
+}
+
+bool Session::set_lifetime(Clock::duration lifetime) {
+    if (lifetime < Clock::duration::zero() || lifetime > std::chrono::hours(24 * 30)) return false;
+    Notification notification{changed_};
+    std::lock_guard lock(mutex_);
+    const bool running = active();
+    lifetime_ = lifetime;
+    if (running) expires_ = lifetime == Clock::duration::zero() ? Clock::time_point::max() : Clock::now() + lifetime;
     notification.changed = true;
     return true;
 }
@@ -428,13 +439,15 @@ bool Session::invitation_active(std::string_view invitation) const {
 Snapshot Session::snapshot(SnapshotPage page) const {
     std::lock_guard lock(mutex_);
     Snapshot result;
+    result.unlimited = lifetime_ == Clock::duration::zero();
+    result.lifetime_seconds = std::chrono::duration_cast<std::chrono::seconds>(lifetime_).count();
     result.active = active();
     result.directory = directory_;
     result.trust_enabled = !trust_directory_.empty();
     if (page == SnapshotPage::all || page == SnapshotPage::received) result.received = received_;
     if (page == SnapshotPage::all || page == SnapshotPage::devices) result.trusted = trusted_;
     if (!result.active) return result;
-    result.remaining_seconds = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::seconds>(expires_ - Clock::now()).count());
+    result.remaining_seconds = result.unlimited ? 0 : std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::seconds>(expires_ - Clock::now()).count());
     result.invitation = invitation_;
     result.code = code_;
     result.messages_cleared = messages_cleared_;
@@ -735,7 +748,7 @@ std::optional<Pairing> Session::pairing(std::string_view token) const {
     if (!active() || !pairing_ || !equals(token, pairing_->token)) return {};
     auto result = *pairing_;
     result.online = Clock::now() - peer_seen_ < std::chrono::seconds(12);
-    result.remaining_seconds = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::seconds>(expires_ - Clock::now()).count());
+    result.remaining_seconds = lifetime_ == Clock::duration::zero() ? 0 : std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::seconds>(expires_ - Clock::now()).count());
     if (result.state == State::pending) result.remaining_seconds = std::max<std::int64_t>(0,
         std::chrono::ceil<std::chrono::seconds>(pairing_deadline_ - Clock::now()).count());
     return result;
@@ -1426,7 +1439,8 @@ bool Session::publish_cast_frame(std::string_view token, unsigned revision, std:
     const auto now = Clock::now();
     if (!cast_available() || !cast_host_access(token) || !cast_.frames || cast_.revision != revision ||
         now - cast_viewer_seen_ >= cast_timeout) return false;
-    if (now - cast_frame_at_ < std::chrono::milliseconds(32)) return true;
+    if (jpeg.size() > max_cast_frame_size) return false;
+    if (now - cast_frame_at_ < std::chrono::milliseconds(8)) return true;
     cast_frame_.jpeg = std::move(jpeg);
     ++cast_frame_.sequence;
     cast_frame_at_ = now;

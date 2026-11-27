@@ -56,7 +56,7 @@ public:
     void start(unsigned short port, bool secure, bool loopback = false);
     void stop();
     void register_routes(httplib::Server& server);
-    bool join(const std::string& address);
+    bool join(const std::string& address, const std::vector<std::string>& alternatives = {}, const std::string& expected_device = {});
     void leave();
     PeerLinkState snapshot() const;
     bool download(const File& file);
@@ -91,6 +91,8 @@ private:
     std::string device_id_;
     std::string device_name_;
     LanEndpoint endpoint_;
+    std::vector<LanEndpoint> alternative_endpoints_;
+    std::string expected_device_;
     PeerLinkState state_;
     std::uint64_t last_message_ = 0;
     std::uint64_t generation_ = 0;

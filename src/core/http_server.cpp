@@ -24,7 +24,6 @@ using httplib::Response;
 constexpr auto json = "application/json; charset=utf-8";
 constexpr auto trust_cookie = "ts_trusted";
 constexpr std::size_t max_sdp_size = 64 * 1024;
-constexpr std::size_t max_cast_frame_size = 384 * 1024;
 
 const char* boolean(bool value) { return value ? "true" : "false"; }
 
@@ -295,6 +294,7 @@ void register_pairing(httplib::Server& server, Session& session, bool secure,
         response.set_content("{\"state\":" + json_string(state_name(pairing->state)) +
             ",\"computer\":" + json_string(device_hostname()) +
             ",\"remainingSeconds\":" + std::to_string(pairing->remaining_seconds) +
+            ",\"unlimited\":" + boolean(session.snapshot(SnapshotPage::home).unlimited) +
             ",\"verification\":" + json_string(pairing->verification) + ",\"download\":" + boolean(permissions.download) +
             ",\"upload\":" + boolean(permissions.upload) + ",\"text\":" + boolean(permissions.text) +
             ",\"castAllowed\":" + boolean(permissions.cast) +
@@ -663,7 +663,7 @@ HttpServer::HttpServer(Session& session, const std::string& certificate, const s
         {"Cache-Control", "no-store"},
         {"Referrer-Policy", "no-referrer"},
         {"X-Content-Type-Options", "nosniff"},
-        {"Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; "
+        {"Content-Security-Policy", "default-src 'none'; script-src 'self'; worker-src 'self' blob:; style-src 'self'; "
                                     "connect-src 'self'; img-src 'self' blob:; media-src 'self' blob:; base-uri 'none'; "
                                     "frame-ancestors 'none'; form-action 'self'"}
     });

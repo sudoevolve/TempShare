@@ -169,6 +169,12 @@ std::vector<std::string> resolve_lan_addresses(const std::string& name) {
     return result;
 }
 
+bool is_local_peer(const Peer& peer, const std::vector<LocalNetwork>& networks, std::string_view id) {
+    return (!id.empty() && peer.id == id) || std::any_of(networks.begin(), networks.end(), [&](const LocalNetwork& network) {
+        return network.address == peer.address;
+    });
+}
+
 std::vector<LocalNetwork> lan_networks() {
     std::vector<LocalNetwork> networks;
 #ifdef _WIN32
@@ -393,8 +399,7 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
                     continue;
                 }
                 auto peer = announcement({incoming, static_cast<std::size_t>(count)}, address);
-                if (peer && peer->id != id_ && (peer->port != port_ || std::none_of(networks.begin(), networks.end(),
-                        [&](const LocalNetwork& network) { return network.address == address; }))) {
+                if (peer && !is_local_peer(*peer, networks, id_)) {
                     std::lock_guard lock(mutex_);
                     const auto found = std::find_if(peers_.begin(), peers_.end(), [&](const Seen& seen) {
                         return !peer->id.empty() ? seen.peer.id == peer->id :
@@ -403,12 +408,20 @@ void Discovery::announce(const std::vector<LocalNetwork>& networks) {
                     if (found != peers_.end()) {
                         changed = found->peer.name != peer->name || found->peer.platform != peer->platform ||
                                   found->peer.secure != peer->secure || found->peer.port != peer->port;
-                        if (std::find(found->peer.addresses.begin(), found->peer.addresses.end(), address) == found->peer.addresses.end()) {
+                        if (found->peer.addresses.size() < 16 &&
+                            std::find(found->peer.addresses.begin(), found->peer.addresses.end(), address) == found->peer.addresses.end()) {
                             found->peer.addresses.push_back(address); changed = true;
                         }
                         found->last = now;
                         found->peer.name = peer->name; found->peer.secure = peer->secure;
                         found->peer.platform = peer->platform; found->peer.port = peer->port;
+                        const auto rank = [&](const std::string& candidate) {
+                            const auto route = std::find_if(networks.begin(), networks.end(), [&](const LocalNetwork& network) {
+                                return network.contains(candidate);
+                            });
+                            return std::distance(networks.begin(), route);
+                        };
+                        if (rank(address) < rank(found->peer.address)) { found->peer.address = address; changed = true; }
                     } else if (peers_.size() < 64) {
                         peers_.push_back(Seen{*peer, now});
                         changed = true;
